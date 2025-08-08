@@ -15,7 +15,7 @@ AI_CACHE_TTL_SECONDS = 1800  # 30 minutes
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 # --------- App ----------
-app = FastAPI(title="Swell Intel Backend", version="1.5.0")
+app = FastAPI(title="Swell Intel Backend", version="1.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,11 +98,10 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     if wvht_m is None:
         return None
 
-    # Convert m/s or knots to mph (NDBC commonly knots in older headers; handle both roughly)
     wind_mph = None
     if wspd_raw is not None:
-        # If value looks like m/s (>40 improbable), assume m/s → mph; otherwise knots → mph
-        wind_mph = round(wspd_raw * 1.15078, 1) if wspd_raw > 40 else round(wspd_raw * 1.15078, 1)
+        # Assume knots → mph
+        wind_mph = round(wspd_raw * 1.15078, 1)
 
     period_s = apd if apd is not None else dpd
 
@@ -115,7 +114,7 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     }
 
 def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int = 300):
-    """Finds nearest numeric station first; falls back to others. Returns (station, conditions-or-None)."""
+    """Find nearest buoy with wave data."""
     stations = get_noaa_stations()
     stations.sort(key=lambda s: haversine(lat, lon, s["lat"], s["lon"]))
 
@@ -135,7 +134,6 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
         if cond:
             return s, cond
 
-    # worst case: return closest station even without conditions
     return stations[0], None
 
 def make_abs(request: Request, path: str) -> str:
@@ -152,7 +150,7 @@ def stability_ai_image(prompt: str) -> Optional[str]:
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
     headers = {
         "Authorization": f"Bearer {STABILITY_API_KEY}",
-        "Accept": "image/*",  # IMPORTANT: Stability needs image/* here
+        "Accept": "image/*",
     }
     data = {
         "prompt": prompt,
@@ -234,7 +232,6 @@ def parse_low_to_rising_window_from_hourly(preds):
             continue
     if len(series) < 3: return None
 
-    # local minima
     mins = []
     for i in range(1, len(series) - 1):
         t0, v0 = series[i-1]
@@ -243,7 +240,6 @@ def parse_low_to_rising_window_from_hourly(preds):
         if v1 <= v0 and v1 <= v2:
             mins.append(series[i][0])
 
-    # pick upcoming, else last today
     next_low = None
     for t in mins:
         if t >= now:
@@ -261,12 +257,10 @@ def health():
 
 @app.get("/summary")
 def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
-    """Human string summary with nearest buoy (or override)."""
     if station_id:
         cond = fetch_noaa_conditions(station_id)
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
         if not cond:
-            print(f"[summary] Override {station_id} -> no wave data")
             return {"summary": f"No live wave data on station {station_id}.", "station": station}
         parts = [f"{cond['wave_height_ft']} ft"]
         if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
@@ -276,7 +270,6 @@ def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
 
     station, cond = find_nearest_station_with_waves(lat, lon)
     if not cond:
-        print(f"[summary] No wave data from candidates. Fallback: {station['id']} {station['name']}")
         return {"summary": "No live wave data available nearby.", "station": station}
 
     parts = [f"{cond['wave_height_ft']} ft"]
@@ -287,7 +280,6 @@ def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
 
 @app.get("/forecast-image")
 def forecast_image(request: Request, lat: float, lon: float, station_id: Optional[str] = Query(None)):
-    """Returns {summary, imageUrl, station}. Uses Stability if available; else /static/forecast.jpg."""
     cache_key = None
     now_ts = datetime.utcnow().timestamp()
     if not station_id:
@@ -342,9 +334,6 @@ def wind(lat: float, lon: float):
 
 @app.get("/optimal-window")
 def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
-    """Pick next low tide today (hilo -> hourly fallback) and define window low -> low+2h.
-       Also return current wind/offshore flag from nearest buoy."""
-    # Tide window
     window = None
     hilo = fetch_todays_hilo(tide_station)
     window = parse_low_to_rising_window_from_hilo(hilo)
@@ -354,15 +343,28 @@ def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
     if not window:
         window = {"start": None, "end": None}
 
-    # Wind now
     station, cond = find_nearest_station_with_waves(lat, lon)
     wind_dir = cond.get("wind_dir_deg") if cond else None
     wind_spd = cond.get("wind_speed_mph") if cond else None
     offshore = is_offshore_east_coast(wind_dir)
 
+    # Decide the note
+    note = None
+    if window.get("start"):
+        wave_height = cond.get("wave_height_ft") if cond else None
+        if wave_height is not None and wave_height > 3:
+            if offshore:
+                note = "Go shred, it's good!"
+            else:
+                note = "Go to work."
+        else:
+            note = "Surf's small, maybe work."
+    else:
+        note = "No explicit low found; check tide station or try another nearby."
+
     return {
         "tide_station": tide_station,
-        "window": window,  # ISO strings or None
+        "window": window,
         "wind": {
             "dir_deg": wind_dir,
             "dir_txt": deg_to_cardinal(wind_dir) if wind_dir is not None else None,
@@ -370,5 +372,5 @@ def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
             "offshore": offshore,
         },
         "buoy_station": station,
-        "note": None if window["start"] else "No explicit low found; check tide station or try another nearby.",
+        "note": note,
     }
