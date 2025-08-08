@@ -4,18 +4,18 @@ from datetime import datetime
 from typing import Dict, Tuple, Optional
 
 import requests
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # ====== Config ======
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional; if missing, we use placeholder image
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional; if missing we use placeholder
 STATIC_DIR = "static"
 AI_CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-app = FastAPI(title="Swell Intel Backend", version="1.1")
+app = FastAPI(title="Swell Intel Backend", version="1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,7 +48,6 @@ def get_noaa_stations():
     r = requests.get(url, timeout=12)
     r.raise_for_status()
     from xml.etree import ElementTree
-
     root = ElementTree.fromstring(r.content)
     stations = []
     for s in root.findall("station"):
@@ -66,10 +65,23 @@ def get_noaa_stations():
     return stations
 
 
+def _float_or_none(x: str) -> Optional[float]:
+    # NDBC uses 'MM' for missing; return None in that case
+    try:
+        if x is None:
+            return None
+        if isinstance(x, str) and x.upper() == "MM":
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
 def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     """
-    Parse NDBC realtime2 text using header names.
-    Returns dict with wave_height_ft, wave_period_s, wind_speed_mph if present.
+    Parse NDBC realtime2 text using header names, tolerant to 'MM'.
+    Returns dict with wave_height_ft, wave_period_s (APD or DPD), wind_speed_mph if any present.
+    Returns None only if *no* usable wave height exists.
     """
     url = f"https://www.ndbc.noaa.gov/data/realtime2/{station_id}.txt"
     r = requests.get(url, timeout=12)
@@ -81,36 +93,42 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
         return None
 
     header = lines[0].split()
-    needed = {"WVHT", "APD", "WSPD"}  # wave height (m), avg period (s), wind speed
-    if not needed.issubset(set(header)):
-        return None  # this station doesn't report waves
-
     latest = lines[2].split()
-    try:
-        idx_wvht = header.index("WVHT")
-        idx_apd = header.index("APD")
-        idx_wspd = header.index("WSPD")
 
-        wave_height_m = float(latest[idx_wvht])
-        wave_period_s = float(latest[idx_apd])
-        wind_speed_val = float(latest[idx_wspd])
-    except Exception:
+    # Map header -> index
+    idx = {h: i for i, h in enumerate(header)}
+
+    # Need at least WVHT to consider it "wave" data
+    if "WVHT" not in idx:
         return None
 
-    # Heuristic: if >40, assume knots; else m/s
-    wind_mph = round(wind_speed_val * 1.15078, 1) if wind_speed_val > 40 else round(wind_speed_val * 2.23694, 1)
+    wvht_m = _float_or_none(latest[idx["WVHT"]]) if idx.get("WVHT") is not None else None
+    if wvht_m is None:
+        return None  # no wave height, bail
+
+    # Prefer APD; fallback to DPD
+    apd = _float_or_none(latest[idx["APD"]]) if "APD" in idx else None
+    dpd = _float_or_none(latest[idx["DPD"]]) if "DPD" in idx else None
+    period_s = apd if apd is not None else dpd
+
+    # Wind speed heuristic: m/s (typical) vs knots (some platforms)
+    wspd_raw = _float_or_none(latest[idx["WSPD"]]) if "WSPD" in idx else None
+    if wspd_raw is None:
+        wind_mph = None
+    else:
+        wind_mph = round(wspd_raw * 1.15078, 1) if wspd_raw > 40 else round(wspd_raw * 2.23694, 1)
 
     return {
-        "wave_height_ft": round(wave_height_m * 3.281, 1),
-        "wave_period_s": round(wave_period_s, 1),
+        "wave_height_ft": round(wvht_m * 3.281, 1),
+        "wave_period_s": round(period_s, 1) if period_s is not None else None,
         "wind_speed_mph": wind_mph,
     }
 
 
-def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int = 150):
+def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int = 300):
     """
-    Prefer true NDBC buoys (numeric IDs), then others. Try many nearest stations
-    and return the first with real wave data; otherwise fallback to nearest.
+    Prefer numeric NDBC buoys, then others. Try many nearest stations and return
+    the first with usable wave height. If none, fallback to nearest (no waves).
     """
     stations = get_noaa_stations()
     stations.sort(key=lambda s: haversine(lat, lon, s["lat"], s["lon"]))
@@ -118,7 +136,6 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
     numeric = [s for s in stations if s["id"].isdigit()]
     non_numeric = [s for s in stations if not s["id"].isdigit()]
 
-    # Try numeric first (most actual buoys report WVHT/APD)
     tried = 0
     for s in numeric:
         if tried >= max_candidates:
@@ -128,20 +145,18 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
         if cond:
             return s, cond
 
-    # Then try others
     for s in non_numeric[:max_candidates]:
         cond = fetch_noaa_conditions(s["id"])
         if cond:
             return s, cond
 
-    # Fallback: nearest station (may not have waves)
-    return stations[0], None
+    return stations[0], None  # fallback
 
 
 def stability_ai_image(prompt: str) -> Optional[str]:
     """Generate an image with Stability.ai; save to /static; return web path."""
     if not STABILITY_API_KEY:
-        print("[stability] STABILITY_API_KEY not set; using placeholder.")
+        print("[stability] STABILITY_API_KEY not set; using placeholder image.")
         return None
 
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
@@ -167,6 +182,11 @@ def stability_ai_image(prompt: str) -> Optional[str]:
         return None
 
 
+def make_abs(request: Request, path: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    return f"{base}{path if path.startswith('/') else '/' + path}"
+
+
 # ====== Endpoints ======
 @app.get("/health")
 def health():
@@ -179,13 +199,17 @@ def summary(
     lon: float,
     station_id: Optional[str] = Query(None, description="Override NOAA station ID (e.g., 41012)"),
 ):
-    # Allow manual override for testing
     if station_id:
         cond = fetch_noaa_conditions(station_id)
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
         if not cond:
             return {"summary": f"No live wave data on station {station_id}.", "station": station}
-        text = f"{cond['wave_height_ft']} ft @ {cond['wave_period_s']} s, wind {cond['wind_speed_mph']} mph — {station['name']} ({station['id']})"
+        parts = [f"{cond['wave_height_ft']} ft"]
+        if cond.get("wave_period_s") is not None:
+            parts.append(f"@ {cond['wave_period_s']} s")
+        if cond.get("wind_speed_mph") is not None:
+            parts.append(f"wind {cond['wind_speed_mph']} mph")
+        text = ", ".join(parts) + f" — {station['name']} ({station['id']})"
         print(f"[summary] Override {station_id} -> {text}")
         return {"summary": text, "station": station}
 
@@ -194,13 +218,19 @@ def summary(
         print(f"[summary] No wave data from candidates. Fallback: {station['id']} {station['name']}")
         return {"summary": "No live wave data available nearby.", "station": station}
 
-    text = f"{cond['wave_height_ft']} ft @ {cond['wave_period_s']} s, wind {cond['wind_speed_mph']} mph — {station['name']} ({station['id']})"
+    parts = [f"{cond['wave_height_ft']} ft"]
+    if cond.get("wave_period_s") is not None:
+        parts.append(f"@ {cond['wave_period_s']} s")
+    if cond.get("wind_speed_mph") is not None:
+        parts.append(f"wind {cond['wind_speed_mph']} mph")
+    text = ", ".join(parts) + f" — {station['name']} ({station['id']})"
     print(f"[summary] Using {station['id']} {station['name']} -> {text}")
     return {"summary": text, "station": station}
 
 
 @app.get("/forecast-image")
 def forecast_image(
+    request: Request,
     lat: float,
     lon: float,
     station_id: Optional[str] = Query(None, description="Override NOAA station ID (e.g., 41012)"),
@@ -222,22 +252,30 @@ def forecast_image(
 
     if not cond:
         print(f"[image] No wave data from candidates. Fallback: {station['id']} {station.get('name','')}")
-        data = {"summary": "No live wave data available nearby.", "imageUrl": "/static/forecast.jpg", "station": station}
+        data = {"summary": "No live wave data available nearby.", "imageUrl": make_abs(request, "/static/forecast.jpg"), "station": station}
         if key:
             _ai_cache[key] = {"data": data, "ts": now_ts}
         return data
 
-    summary_text = f"{cond['wave_height_ft']} ft @ {cond['wave_period_s']} s, wind {cond['wind_speed_mph']} mph — {station['name']}"
+    parts = [f"{cond['wave_height_ft']} ft"]
+    if cond.get("wave_period_s") is not None:
+        parts.append(f"@ {cond['wave_period_s']} s")
+    if cond.get("wind_speed_mph") is not None:
+        parts.append(f"wind {cond['wind_speed_mph']} mph")
+    summary_text = ", ".join(parts) + f" — {station['name']}"
+
     prompt = (
         f"Photorealistic surf scene at {station['name']}, "
-        f"waves {cond['wave_height_ft']} feet at {cond['wave_period_s']} seconds, "
-        f"wind {cond['wind_speed_mph']} mph. Natural colors, coastal perspective, 16:9."
+        f"waves {cond['wave_height_ft']} feet"
+        + (f" at {cond['wave_period_s']} seconds" if cond.get('wave_period_s') is not None else "")
+        + (f", wind {cond['wind_speed_mph']} mph" if cond.get('wind_speed_mph') is not None else "")
+        + ". Natural colors, coastal perspective, 16:9."
     )
 
-    image_path = stability_ai_image(prompt) or "/static/forecast.jpg"
-    data = {"summary": summary_text, "imageUrl": image_path, "station": station}
+    image_rel = stability_ai_image(prompt) or "/static/forecast.jpg"
+    data = {"summary": summary_text, "imageUrl": make_abs(request, image_rel), "station": station}
     if key:
         _ai_cache[key] = {"data": data, "ts": now_ts}
 
-    print(f"[image] Generated for {station['id']} {station.get('name','')} -> {image_path}")
+    print(f"[image] Generated for {station['id']} {station.get('name','')} -> {data['imageUrl']}")
     return data
