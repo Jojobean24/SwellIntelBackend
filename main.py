@@ -1,49 +1,61 @@
 import os
 import math
-from datetime import datetime
+import requests
+from datetime import datetime, date, timedelta
 from typing import Dict, Tuple, Optional
 
-import requests
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# ====== Config ======
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional; placeholder used if missing or errors
+# --------- Env & constants ----------
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional
 STATIC_DIR = "static"
 AI_CACHE_TTL_SECONDS = 1800  # 30 minutes
-
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-app = FastAPI(title="Swell Intel Backend", version="1.3")
+# --------- App ----------
+app = FastAPI(title="Swell Intel Backend", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# In-memory cache for AI images keyed by rounded lat/lon
+# Simple cache for image responses keyed by rounded lat/lon
 _ai_cache: Dict[Tuple[float, float], Dict] = {}
 
-
-# ====== Helpers ======
+# --------- Helpers ----------
 def haversine(lat1, lon1, lat2, lon2) -> float:
-    R = 6371.0  # km
+    R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(
-        math.radians(lat2)
-    ) * math.sin(dlon / 2) ** 2
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
+def _float_or_none(x: Optional[str]) -> Optional[float]:
+    try:
+        if x is None: return None
+        if isinstance(x, str) and x.upper() == "MM": return None
+        return float(x)
+    except Exception:
+        return None
+
+def deg_to_cardinal(deg: float) -> str:
+    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
+    ix = int((deg % 360) / 22.5 + 0.5) % 16
+    return dirs[ix]
+
+def is_offshore_east_coast(wdir: Optional[float]) -> bool:
+    # Heuristic for US East Coast: offshore-ish if winds are W quadrant (210–330)
+    if wdir is None: return False
+    return 210 <= (wdir % 360) <= 330
 
 def get_noaa_stations():
-    """Fetch active NOAA stations (XML) with lat/lon/name/id."""
+    """Active NDBC stations (XML)."""
     url = "https://www.ndbc.noaa.gov/activestations.xml"
     r = requests.get(url, timeout=12)
     r.raise_for_status()
@@ -52,37 +64,18 @@ def get_noaa_stations():
     stations = []
     for s in root.findall("station"):
         try:
-            stations.append(
-                {
-                    "id": s.attrib["id"],
-                    "lat": float(s.attrib["lat"]),
-                    "lon": float(s.attrib["lon"]),
-                    "name": s.attrib.get("name", ""),
-                }
-            )
+            stations.append({
+                "id": s.attrib["id"],
+                "lat": float(s.attrib["lat"]),
+                "lon": float(s.attrib["lon"]),
+                "name": s.attrib.get("name", ""),
+            })
         except Exception:
             continue
     return stations
 
-
-def _float_or_none(x: str) -> Optional[float]:
-    # NDBC uses 'MM' for missing; return None in that case
-    try:
-        if x is None:
-            return None
-        if isinstance(x, str) and x.upper() == "MM":
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
 def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
-    """
-    Parse NDBC realtime2 text using header names, tolerant to 'MM'.
-    Returns dict with wave_height_ft, wave_period_s (APD or DPD), wind_speed_mph if available.
-    Returns None only if *no* usable wave height exists.
-    """
+    """Read latest line from realtime2 .txt for a station."""
     url = f"https://www.ndbc.noaa.gov/data/realtime2/{station_id}.txt"
     r = requests.get(url, timeout=12)
     if r.status_code != 200:
@@ -96,39 +89,33 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     latest = lines[2].split()
     idx = {h: i for i, h in enumerate(header)}
 
-    # Need at least wave height to consider it usable
-    if "WVHT" not in idx:
-        return None
-
-    wvht_m = _float_or_none(latest[idx["WVHT"]]) if idx.get("WVHT") is not None else None
-    if wvht_m is None:
-        return None  # no wave height, bail
-
-    # Prefer APD; fallback to DPD
+    wvht_m = _float_or_none(latest[idx["WVHT"]]) if "WVHT" in idx else None
     apd = _float_or_none(latest[idx["APD"]]) if "APD" in idx else None
     dpd = _float_or_none(latest[idx["DPD"]]) if "DPD" in idx else None
-    period_s = apd if apd is not None else dpd
-
-    # Wind speed: many feeds are m/s, some knots; heuristic conversion
     wspd_raw = _float_or_none(latest[idx["WSPD"]]) if "WSPD" in idx else None
-    if wspd_raw is None:
-        wind_mph = None
-    else:
-        wind_mph = round(wspd_raw * 1.15078, 1) if wspd_raw > 40 else round(wspd_raw * 2.23694, 1)
+    wdir_deg = _float_or_none(latest[idx["WDIR"]]) if "WDIR" in idx else None
+
+    if wvht_m is None:
+        return None
+
+    # Convert m/s or knots to mph (NDBC commonly knots in older headers; handle both roughly)
+    wind_mph = None
+    if wspd_raw is not None:
+        # If value looks like m/s (>40 improbable), assume m/s → mph; otherwise knots → mph
+        wind_mph = round(wspd_raw * 1.15078, 1) if wspd_raw > 40 else round(wspd_raw * 1.15078, 1)
+
+    period_s = apd if apd is not None else dpd
 
     return {
         "wave_height_ft": round(wvht_m * 3.281, 1),
         "wave_period_s": round(period_s, 1) if period_s is not None else None,
         "wind_speed_mph": wind_mph,
+        "wind_dir_deg": wdir_deg,
+        "wind_dir_txt": deg_to_cardinal(wdir_deg) if wdir_deg is not None else None,
     }
 
-
 def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int = 300):
-    """
-    Prefer numeric NDBC buoys (IDs like '41012'), then others.
-    Try many nearest stations and return the first with usable wave height.
-    If none report waves, fallback to nearest (no waves).
-    """
+    """Finds nearest numeric station first; falls back to others. Returns (station, conditions-or-None)."""
     stations = get_noaa_stations()
     stations.sort(key=lambda s: haversine(lat, lon, s["lat"], s["lon"]))
 
@@ -137,8 +124,7 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
 
     tried = 0
     for s in numeric:
-        if tried >= max_candidates:
-            break
+        if tried >= max_candidates: break
         tried += 1
         cond = fetch_noaa_conditions(s["id"])
         if cond:
@@ -149,78 +135,143 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
         if cond:
             return s, cond
 
-    return stations[0], None  # fallback only
-
-def stability_ai_image(prompt: str) -> Optional[str]:
-    """Generate an image with Stability.ai; save to /static; return web path."""
-    if not STABILITY_API_KEY:
-        print("[stability] STABILITY_API_KEY not set; using placeholder image.")
-        return None
-
-    url = "https://api.stability.ai/v2beta/stable-image/generate/core"
-    headers = {
-        "Authorization": f"Bearer {STABILITY_API_KEY}",
-        "Accept": "image/*",            # REQUIRED
-    }
-
-    # Stability's v2beta core endpoint expects multipart form fields; include a model
-    data = {
-        "prompt": prompt,
-        "model": "sd3.5-large",         # <- explicit model is safest
-        "output_format": "png",
-        "aspect_ratio": "16:9",
-        # "style_preset": "photographic",  # optional, you can uncomment
-    }
-
-    try:
-        # Send as multipart/form-data using 'data=' (text fields) without 'files'
-        r = requests.post(url, headers=headers, data=data, timeout=60)
-        if r.status_code != 200:
-            print("[stability] API error:", r.status_code, r.text[:400])
-            return None
-
-        fname = f"surf_{int(datetime.utcnow().timestamp())}.png"
-        path = os.path.join(STATIC_DIR, fname)
-        with open(path, "wb") as f:
-            f.write(r.content)
-        return f"/static/{fname}"
-
-    except Exception as e:
-        print("[stability] Exception:", e)
-        return None
-
+    # worst case: return closest station even without conditions
+    return stations[0], None
 
 def make_abs(request: Request, path: str) -> str:
     base = str(request.base_url).rstrip("/")
     return f"{base}{path if path.startswith('/') else '/' + path}"
 
+# --------- Stability image (optional) ----------
+def stability_ai_image(prompt: str) -> Optional[str]:
+    """Generate an image with Stability if API key present; return relative /static path."""
+    if not STABILITY_API_KEY:
+        print("[stability] STABILITY_API_KEY not set; using placeholder.")
+        return None
 
-# ====== Endpoints ======
+    url = "https://api.stability.ai/v2beta/stable-image/generate/core"
+    headers = {
+        "Authorization": f"Bearer {STABILITY_API_KEY}",
+        "Accept": "image/*",  # IMPORTANT: Stability needs image/* here
+    }
+    data = {
+        "prompt": prompt,
+        "model": "sd3.5-large",
+        "output_format": "png",
+        "aspect_ratio": "16:9",
+    }
+    try:
+        r = requests.post(url, headers=headers, data=data, timeout=60)
+        if r.status_code != 200:
+            print("[stability] API error:", r.status_code, r.text[:400])
+            return None
+        fname = f"surf_{int(datetime.utcnow().timestamp())}.png"
+        path = os.path.join(STATIC_DIR, fname)
+        with open(path, "wb") as f:
+            f.write(r.content)
+        return f"/static/{fname}"
+    except Exception as e:
+        print("[stability] Exception:", e)
+        return None
+
+# --------- Tides (NOAA CO-OPS) ----------
+def _noaa_get(url: str):
+    try:
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("[tides] fetch error:", e)
+        return None
+
+def fetch_todays_hilo(tide_station: str):
+    today = date.today().strftime("%Y%m%d")
+    url = (
+        "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
+        f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
+        f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=hilo&format=json"
+    )
+    j = _noaa_get(url)
+    return j.get("predictions") if j else None
+
+def fetch_todays_hourly(tide_station: str):
+    today = date.today().strftime("%Y%m%d")
+    url = (
+        "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
+        f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
+        f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=h&format=json"
+    )
+    j = _noaa_get(url)
+    return j.get("predictions") if j else None
+
+def parse_low_to_rising_window_from_hilo(preds):
+    if not preds: return None
+    fmt = "%Y-%m-%d %H:%M"
+    now = datetime.now()
+    lows = [p for p in preds if p.get("type") == "L"]
+    if not lows: return None
+    next_low = None
+    for p in lows:
+        t = datetime.strptime(p["t"], fmt)
+        if t >= now:
+            next_low = t
+            break
+    if not next_low:
+        next_low = datetime.strptime(lows[-1]["t"], fmt)
+    return {"start": next_low.isoformat(), "end": (next_low + timedelta(hours=2)).isoformat()}
+
+def parse_low_to_rising_window_from_hourly(preds):
+    if not preds: return None
+    fmt = "%Y-%m-%d %H:%M"
+    now = datetime.now()
+    series = []
+    for p in preds:
+        try:
+            t = datetime.strptime(p["t"], fmt)
+            v = float(p["v"])
+            series.append((t, v))
+        except:
+            continue
+    if len(series) < 3: return None
+
+    # local minima
+    mins = []
+    for i in range(1, len(series) - 1):
+        t0, v0 = series[i-1]
+        t1, v1 = series[i]
+        t2, v2 = series[i+1]
+        if v1 <= v0 and v1 <= v2:
+            mins.append(series[i][0])
+
+    # pick upcoming, else last today
+    next_low = None
+    for t in mins:
+        if t >= now:
+            next_low = t
+            break
+    if not next_low:
+        next_low = mins[-1]
+
+    return {"start": next_low.isoformat(), "end": (next_low + timedelta(hours=2)).isoformat()}
+
+# --------- Routes ----------
 @app.get("/health")
 def health():
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
-
 @app.get("/summary")
-def summary(
-    lat: float,
-    lon: float,
-    station_id: Optional[str] = Query(None, description="Override NOAA station ID (e.g., 41012)"),
-):
+def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
+    """Human string summary with nearest buoy (or override)."""
     if station_id:
         cond = fetch_noaa_conditions(station_id)
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
         if not cond:
             print(f"[summary] Override {station_id} -> no wave data")
             return {"summary": f"No live wave data on station {station_id}.", "station": station}
-
         parts = [f"{cond['wave_height_ft']} ft"]
-        if cond.get("wave_period_s") is not None:
-            parts.append(f"@ {cond['wave_period_s']} s")
-        if cond.get("wind_speed_mph") is not None:
-            parts.append(f"wind {cond['wind_speed_mph']} mph")
+        if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
+        if cond.get("wind_speed_mph") is not None: parts.append(f"wind {cond['wind_speed_mph']} mph")
         text = ", ".join(parts) + f" — {station['name']} ({station['id']})"
-        print(f"[summary] Override {station_id} -> {text}")
         return {"summary": text, "station": station}
 
     station, cond = find_nearest_station_with_waves(lat, lon)
@@ -229,31 +280,21 @@ def summary(
         return {"summary": "No live wave data available nearby.", "station": station}
 
     parts = [f"{cond['wave_height_ft']} ft"]
-    if cond.get("wave_period_s") is not None:
-        parts.append(f"@ {cond['wave_period_s']} s")
-    if cond.get("wind_speed_mph") is not None:
-        parts.append(f"wind {cond['wind_speed_mph']} mph")
+    if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
+    if cond.get("wind_speed_mph") is not None: parts.append(f"wind {cond['wind_speed_mph']} mph")
     text = ", ".join(parts) + f" — {station['name']} ({station['id']})"
-    print(f"[summary] Using {station['id']} {station['name']} -> {text}")
     return {"summary": text, "station": station}
 
-
 @app.get("/forecast-image")
-def forecast_image(
-    request: Request,
-    lat: float,
-    lon: float,
-    station_id: Optional[str] = Query(None, description="Override NOAA station ID (e.g., 41012)"),
-):
-    # Cache by rounded lat/lon when not overriding
-    key = None
+def forecast_image(request: Request, lat: float, lon: float, station_id: Optional[str] = Query(None)):
+    """Returns {summary, imageUrl, station}. Uses Stability if available; else /static/forecast.jpg."""
+    cache_key = None
     now_ts = datetime.utcnow().timestamp()
     if not station_id:
-        key = (round(lat, 3), round(lon, 3))
-        if key in _ai_cache and now_ts - _ai_cache[key]["ts"] < AI_CACHE_TTL_SECONDS:
-            return _ai_cache[key]["data"]
+        cache_key = (round(lat, 3), round(lon, 3))
+        if cache_key in _ai_cache and now_ts - _ai_cache[cache_key]["ts"] < AI_CACHE_TTL_SECONDS:
+            return _ai_cache[cache_key]["data"]
 
-    # Station selection
     if station_id:
         cond = fetch_noaa_conditions(station_id)
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
@@ -261,35 +302,73 @@ def forecast_image(
         station, cond = find_nearest_station_with_waves(lat, lon)
 
     if not cond:
-        print(f"[image] No wave data from candidates. Fallback: {station['id']} {station.get('name','')}")
-        data = {
-            "summary": "No live wave data available nearby.",
-            "imageUrl": make_abs(request, "/static/forecast.jpg"),
-            "station": station,
-        }
-        if key:
-            _ai_cache[key] = {"data": data, "ts": now_ts}
+        data = {"summary": "No live wave data available nearby.",
+                "imageUrl": make_abs(request, "/static/forecast.jpg"),
+                "station": station}
+        if cache_key:
+            _ai_cache[cache_key] = {"data": data, "ts": now_ts}
         return data
 
     parts = [f"{cond['wave_height_ft']} ft"]
-    if cond.get("wave_period_s") is not None:
-        parts.append(f"@ {cond['wave_period_s']} s")
-    if cond.get("wind_speed_mph") is not None:
-        parts.append(f"wind {cond['wind_speed_mph']} mph")
+    if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
+    if cond.get("wind_speed_mph") is not None: parts.append(f"wind {cond['wind_speed_mph']} mph")
     summary_text = ", ".join(parts) + f" — {station['name']}"
 
     prompt = (
-        f"Photorealistic surf scene at {station['name']}, "
-        f"waves {cond['wave_height_ft']} feet"
+        f"Photorealistic surf scene at {station['name']}, waves {cond['wave_height_ft']} feet"
         + (f" at {cond['wave_period_s']} seconds" if cond.get('wave_period_s') is not None else "")
         + (f", wind {cond['wind_speed_mph']} mph" if cond.get('wind_speed_mph') is not None else "")
-        + ". Natural colors, coastal perspective, 16:9."
+        + ". Natural colors, realistic ocean, 16:9 composition."
     )
 
     image_rel = stability_ai_image(prompt) or "/static/forecast.jpg"
     data = {"summary": summary_text, "imageUrl": make_abs(request, image_rel), "station": station}
-    if key:
-        _ai_cache[key] = {"data": data, "ts": now_ts}
-
-    print(f"[image] Generated for {station['id']} {station.get('name','')} -> {data['imageUrl']}")
+    if cache_key:
+        _ai_cache[cache_key] = {"data": data, "ts": now_ts}
     return data
+
+@app.get("/wind")
+def wind(lat: float, lon: float):
+    station, cond = find_nearest_station_with_waves(lat, lon)
+    if not cond:
+        raise HTTPException(404, "No nearby wave station.")
+    return {
+        "station": station,
+        "wind_speed_mph": cond.get("wind_speed_mph"),
+        "wind_dir_deg": cond.get("wind_dir_deg"),
+        "wind_dir_txt": cond.get("wind_dir_txt"),
+        "offshore": is_offshore_east_coast(cond.get("wind_dir_deg")),
+    }
+
+@app.get("/optimal-window")
+def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
+    """Pick next low tide today (hilo -> hourly fallback) and define window low -> low+2h.
+       Also return current wind/offshore flag from nearest buoy."""
+    # Tide window
+    window = None
+    hilo = fetch_todays_hilo(tide_station)
+    window = parse_low_to_rising_window_from_hilo(hilo)
+    if not window:
+        hourly = fetch_todays_hourly(tide_station)
+        window = parse_low_to_rising_window_from_hourly(hourly)
+    if not window:
+        window = {"start": None, "end": None}
+
+    # Wind now
+    station, cond = find_nearest_station_with_waves(lat, lon)
+    wind_dir = cond.get("wind_dir_deg") if cond else None
+    wind_spd = cond.get("wind_speed_mph") if cond else None
+    offshore = is_offshore_east_coast(wind_dir)
+
+    return {
+        "tide_station": tide_station,
+        "window": window,  # ISO strings or None
+        "wind": {
+            "dir_deg": wind_dir,
+            "dir_txt": deg_to_cardinal(wind_dir) if wind_dir is not None else None,
+            "speed_mph": wind_spd,
+            "offshore": offshore,
+        },
+        "buoy_station": station,
+        "note": None if window["start"] else "No explicit low found; check tide station or try another nearby.",
+    }
