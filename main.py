@@ -4,18 +4,18 @@ from datetime import datetime
 from typing import Dict, Tuple, Optional
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # ====== Config ======
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional; we fallback to placeholder if missing
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional; if missing, we use placeholder image
 STATIC_DIR = "static"
 AI_CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-app = FastAPI(title="Swell Intel Backend", version="1.0")
+app = FastAPI(title="Swell Intel Backend", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,7 +27,7 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# Simple in-memory cache for AI images keyed by rounded lat/lon
+# In-memory cache for AI images keyed by rounded lat/lon
 _ai_cache: Dict[Tuple[float, float], Dict] = {}
 
 
@@ -68,7 +68,7 @@ def get_noaa_stations():
 
 def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     """
-    Parse NDBC realtime2 text using header names (robust to column shifts).
+    Parse NDBC realtime2 text using header names.
     Returns dict with wave_height_ft, wave_period_s, wind_speed_mph if present.
     """
     url = f"https://www.ndbc.noaa.gov/data/realtime2/{station_id}.txt"
@@ -81,7 +81,6 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
         return None
 
     header = lines[0].split()
-    # Required columns for a 'valid' wave observation
     needed = {"WVHT", "APD", "WSPD"}  # wave height (m), avg period (s), wind speed
     if not needed.issubset(set(header)):
         return None  # this station doesn't report waves
@@ -98,7 +97,7 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     except Exception:
         return None
 
-    # Convert wind speed heuristically: if it's big, assume knots; else assume m/s
+    # Heuristic: if >40, assume knots; else m/s
     wind_mph = round(wind_speed_val * 1.15078, 1) if wind_speed_val > 40 else round(wind_speed_val * 2.23694, 1)
 
     return {
@@ -108,27 +107,41 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     }
 
 
-def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int = 15):
+def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int = 150):
     """
-    Sort stations by distance and return (station, cond) where cond is parsed data.
-    Tries up to max_candidates; falls back to the nearest station if none report waves.
+    Prefer true NDBC buoys (numeric IDs), then others. Try many nearest stations
+    and return the first with real wave data; otherwise fallback to nearest.
     """
     stations = get_noaa_stations()
     stations.sort(key=lambda s: haversine(lat, lon, s["lat"], s["lon"]))
 
-    for s in stations[:max_candidates]:
+    numeric = [s for s in stations if s["id"].isdigit()]
+    non_numeric = [s for s in stations if not s["id"].isdigit()]
+
+    # Try numeric first (most actual buoys report WVHT/APD)
+    tried = 0
+    for s in numeric:
+        if tried >= max_candidates:
+            break
+        tried += 1
         cond = fetch_noaa_conditions(s["id"])
         if cond:
             return s, cond
 
-    # Fallback: return nearest station even without wave data
+    # Then try others
+    for s in non_numeric[:max_candidates]:
+        cond = fetch_noaa_conditions(s["id"])
+        if cond:
+            return s, cond
+
+    # Fallback: nearest station (may not have waves)
     return stations[0], None
 
 
 def stability_ai_image(prompt: str) -> Optional[str]:
     """Generate an image with Stability.ai; save to /static; return web path."""
     if not STABILITY_API_KEY:
-        print("[stability] STABILITY_API_KEY not set; returning None.")
+        print("[stability] STABILITY_API_KEY not set; using placeholder.")
         return None
 
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
@@ -161,10 +174,24 @@ def health():
 
 
 @app.get("/summary")
-def summary(lat: float, lon: float):
+def summary(
+    lat: float,
+    lon: float,
+    station_id: Optional[str] = Query(None, description="Override NOAA station ID (e.g., 41012)"),
+):
+    # Allow manual override for testing
+    if station_id:
+        cond = fetch_noaa_conditions(station_id)
+        station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
+        if not cond:
+            return {"summary": f"No live wave data on station {station_id}.", "station": station}
+        text = f"{cond['wave_height_ft']} ft @ {cond['wave_period_s']} s, wind {cond['wind_speed_mph']} mph — {station['name']} ({station['id']})"
+        print(f"[summary] Override {station_id} -> {text}")
+        return {"summary": text, "station": station}
+
     station, cond = find_nearest_station_with_waves(lat, lon)
     if not cond:
-        print(f"[summary] No wave data from nearest candidates. Fallback: {station['id']} {station['name']}")
+        print(f"[summary] No wave data from candidates. Fallback: {station['id']} {station['name']}")
         return {"summary": "No live wave data available nearby.", "station": station}
 
     text = f"{cond['wave_height_ft']} ft @ {cond['wave_period_s']} s, wind {cond['wind_speed_mph']} mph — {station['name']} ({station['id']})"
@@ -173,30 +200,44 @@ def summary(lat: float, lon: float):
 
 
 @app.get("/forecast-image")
-def forecast_image(lat: float, lon: float):
-    # 30‑min cache by rounded location
-    key = (round(lat, 3), round(lon, 3))
+def forecast_image(
+    lat: float,
+    lon: float,
+    station_id: Optional[str] = Query(None, description="Override NOAA station ID (e.g., 41012)"),
+):
+    # Cache by rounded lat/lon when not overriding
+    key = None
     now_ts = datetime.utcnow().timestamp()
-    if key in _ai_cache and now_ts - _ai_cache[key]["ts"] < AI_CACHE_TTL_SECONDS:
-        return _ai_cache[key]["data"]
+    if not station_id:
+        key = (round(lat, 3), round(lon, 3))
+        if key in _ai_cache and now_ts - _ai_cache[key]["ts"] < AI_CACHE_TTL_SECONDS:
+            return _ai_cache[key]["data"]
 
-    station, cond = find_nearest_station_with_waves(lat, lon)
+    # Station selection
+    if station_id:
+        cond = fetch_noaa_conditions(station_id)
+        station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
+    else:
+        station, cond = find_nearest_station_with_waves(lat, lon)
+
     if not cond:
-        print(f"[image] No wave data from nearest candidates. Fallback: {station['id']} {station['name']}")
+        print(f"[image] No wave data from candidates. Fallback: {station['id']} {station.get('name','')}")
         data = {"summary": "No live wave data available nearby.", "imageUrl": "/static/forecast.jpg", "station": station}
-        _ai_cache[key] = {"data": data, "ts": now_ts}
+        if key:
+            _ai_cache[key] = {"data": data, "ts": now_ts}
         return data
 
     summary_text = f"{cond['wave_height_ft']} ft @ {cond['wave_period_s']} s, wind {cond['wind_speed_mph']} mph — {station['name']}"
     prompt = (
         f"Photorealistic surf scene at {station['name']}, "
         f"waves {cond['wave_height_ft']} feet at {cond['wave_period_s']} seconds, "
-        f"wind {cond['wind_speed_mph']} mph. Modern camera, coastal viewpoint, natural colors, 16:9."
+        f"wind {cond['wind_speed_mph']} mph. Natural colors, coastal perspective, 16:9."
     )
 
     image_path = stability_ai_image(prompt) or "/static/forecast.jpg"
     data = {"summary": summary_text, "imageUrl": image_path, "station": station}
-    _ai_cache[key] = {"data": data, "ts": now_ts}
+    if key:
+        _ai_cache[key] = {"data": data, "ts": now_ts}
 
-    print(f"[image] Generated for {station['id']} {station['name']} -> {image_path}")
+    print(f"[image] Generated for {station['id']} {station.get('name','')} -> {image_path}")
     return data
