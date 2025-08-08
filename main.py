@@ -151,7 +151,6 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
 
     return stations[0], None  # fallback only
 
-
 def stability_ai_image(prompt: str) -> Optional[str]:
     """Generate an image with Stability.ai; save to /static; return web path."""
     if not STABILITY_API_KEY:
@@ -161,25 +160,31 @@ def stability_ai_image(prompt: str) -> Optional[str]:
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
     headers = {
         "Authorization": f"Bearer {STABILITY_API_KEY}",
-        "Accept": "image/*",  # REQUIRED by Stability; fixes 400 'accept' error
+        "Accept": "image/*",            # REQUIRED
     }
-    files = {
-        "prompt": (None, prompt),
-        "output_format": (None, "png"),
-        "aspect_ratio": (None, "16:9"),
-        # "style_preset": (None, "photographic"),  # optional stylistic nudge
+
+    # Stability's v2beta core endpoint expects multipart form fields; include a model
+    data = {
+        "prompt": prompt,
+        "model": "sd3.5-large",         # <- explicit model is safest
+        "output_format": "png",
+        "aspect_ratio": "16:9",
+        # "style_preset": "photographic",  # optional, you can uncomment
     }
 
     try:
-        r = requests.post(url, headers=headers, files=files, timeout=60)
+        # Send as multipart/form-data using 'data=' (text fields) without 'files'
+        r = requests.post(url, headers=headers, data=data, timeout=60)
         if r.status_code != 200:
-            print("[stability] API error:", r.status_code, r.text[:300])
+            print("[stability] API error:", r.status_code, r.text[:400])
             return None
+
         fname = f"surf_{int(datetime.utcnow().timestamp())}.png"
         path = os.path.join(STATIC_DIR, fname)
         with open(path, "wb") as f:
             f.write(r.content)
         return f"/static/{fname}"
+
     except Exception as e:
         print("[stability] Exception:", e)
         return None
