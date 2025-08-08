@@ -9,13 +9,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # --------- Env & constants ----------
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # set in Render → Environment
 STATIC_DIR = "static"
 AI_CACHE_TTL_SECONDS = 1800  # 30 minutes
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 # --------- App ----------
-app = FastAPI(title="Swell Intel Backend", version="1.6.0")
+app = FastAPI(title="Swell Intel Backend", version="1.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,12 +50,11 @@ def deg_to_cardinal(deg: float) -> str:
     return dirs[ix]
 
 def is_offshore_east_coast(wdir: Optional[float]) -> bool:
-    # Heuristic for US East Coast: offshore-ish if winds are W quadrant (210–330)
+    # Heuristic for US East Coast: W quadrant is roughly offshore (210–330)
     if wdir is None: return False
     return 210 <= (wdir % 360) <= 330
 
 def get_noaa_stations():
-    """Active NDBC stations (XML)."""
     url = "https://www.ndbc.noaa.gov/activestations.xml"
     r = requests.get(url, timeout=12)
     r.raise_for_status()
@@ -75,12 +74,10 @@ def get_noaa_stations():
     return stations
 
 def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
-    """Read latest line from realtime2 .txt for a station."""
     url = f"https://www.ndbc.noaa.gov/data/realtime2/{station_id}.txt"
     r = requests.get(url, timeout=12)
     if r.status_code != 200:
         return None
-
     lines = r.text.splitlines()
     if len(lines) < 3:
         return None
@@ -100,7 +97,7 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
 
     wind_mph = None
     if wspd_raw is not None:
-        # Assume knots → mph
+        # NDBC usually reports knots; convert to mph
         wind_mph = round(wspd_raw * 1.15078, 1)
 
     period_s = apd if apd is not None else dpd
@@ -114,7 +111,6 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     }
 
 def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int = 300):
-    """Find nearest buoy with wave data."""
     stations = get_noaa_stations()
     stations.sort(key=lambda s: haversine(lat, lon, s["lat"], s["lon"]))
 
@@ -140,7 +136,7 @@ def make_abs(request: Request, path: str) -> str:
     base = str(request.base_url).rstrip("/")
     return f"{base}{path if path.startswith('/') else '/' + path}"
 
-# --------- Stability image (optional) ----------
+# --------- Stability image ----------
 def stability_ai_image(prompt: str) -> Optional[str]:
     """Generate an image with Stability if API key present; return relative /static path."""
     if not STABILITY_API_KEY:
@@ -150,8 +146,9 @@ def stability_ai_image(prompt: str) -> Optional[str]:
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
     headers = {
         "Authorization": f"Bearer {STABILITY_API_KEY}",
-        "Accept": "image/*",
+        "Accept": "image/*",  # IMPORTANT: their API expects this
     }
+    # Send as form fields (Stability accepts form-data even without files)
     data = {
         "prompt": prompt,
         "model": "sd3.5-large",
@@ -279,12 +276,18 @@ def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
     return {"summary": text, "station": station}
 
 @app.get("/forecast-image")
-def forecast_image(request: Request, lat: float, lon: float, station_id: Optional[str] = Query(None)):
+def forecast_image(
+    request: Request,
+    lat: float,
+    lon: float,
+    station_id: Optional[str] = Query(None),
+    force: int = Query(0)  # force=1 disables cache during dev
+):
     cache_key = None
     now_ts = datetime.utcnow().timestamp()
     if not station_id:
         cache_key = (round(lat, 3), round(lon, 3))
-        if cache_key in _ai_cache and now_ts - _ai_cache[cache_key]["ts"] < AI_CACHE_TTL_SECONDS:
+        if not force and cache_key in _ai_cache and now_ts - _ai_cache[cache_key]["ts"] < AI_CACHE_TTL_SECONDS:
             return _ai_cache[cache_key]["data"]
 
     if station_id:
@@ -294,9 +297,12 @@ def forecast_image(request: Request, lat: float, lon: float, station_id: Optiona
         station, cond = find_nearest_station_with_waves(lat, lon)
 
     if not cond:
-        data = {"summary": "No live wave data available nearby.",
-                "imageUrl": make_abs(request, "/static/forecast.jpg"),
-                "station": station}
+        data = {
+            "summary": "No live wave data available nearby.",
+            "imageUrl": make_abs(request, "/static/forecast.jpg"),
+            "station": station,
+            "imageProvider": "placeholder"
+        }
         if cache_key:
             _ai_cache[cache_key] = {"data": data, "ts": now_ts}
         return data
@@ -307,14 +313,18 @@ def forecast_image(request: Request, lat: float, lon: float, station_id: Optiona
     summary_text = ", ".join(parts) + f" — {station['name']}"
 
     prompt = (
-        f"Photorealistic surf scene at {station['name']}, waves {cond['wave_height_ft']} feet"
+        f"Photorealistic surf scene near {station['name']}, waves {cond['wave_height_ft']} feet"
         + (f" at {cond['wave_period_s']} seconds" if cond.get('wave_period_s') is not None else "")
         + (f", wind {cond['wind_speed_mph']} mph" if cond.get('wind_speed_mph') is not None else "")
-        + ". Natural colors, realistic ocean, 16:9 composition."
+        + ". Natural colors, realistic ocean texture, late light, 16:9 composition, high detail."
     )
 
-    image_rel = stability_ai_image(prompt) or "/static/forecast.jpg"
-    data = {"summary": summary_text, "imageUrl": make_abs(request, image_rel), "station": station}
+    image_rel = stability_ai_image(prompt)
+    provider = "stability" if image_rel else "placeholder"
+    if not image_rel:
+        image_rel = "/static/forecast.jpg"
+
+    data = {"summary": summary_text, "imageUrl": make_abs(request, image_rel), "station": station, "imageProvider": provider}
     if cache_key:
         _ai_cache[cache_key] = {"data": data, "ts": now_ts}
     return data
@@ -331,6 +341,60 @@ def wind(lat: float, lon: float):
         "wind_dir_txt": cond.get("wind_dir_txt"),
         "offshore": is_offshore_east_coast(cond.get("wind_dir_deg")),
     }
+
+# ---------- Strike window ----------
+def _noaa_get_json(url: str):
+    try:
+        r = requests.get(url, timeout=12); r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("[tides] fetch error:", e); return None
+
+def fetch_todays_hilo(tide_station: str):
+    today = date.today().strftime("%Y%m%d")
+    url = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
+           f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
+           f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=hilo&format=json")
+    j = _noaa_get_json(url); return j.get("predictions") if j else None
+
+def fetch_todays_hourly(tide_station: str):
+    today = date.today().strftime("%Y%m%d")
+    url = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
+           f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
+           f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=h&format=json")
+    j = _noaa_get_json(url); return j.get("predictions") if j else None
+
+def parse_low_to_rising_window_from_hilo(preds):
+    if not preds: return None
+    fmt = "%Y-%m-%d %H:%M"; now = datetime.now()
+    lows = [p for p in preds if p.get("type") == "L"]
+    if not lows: return None
+    next_low = None
+    for p in lows:
+        t = datetime.strptime(p["t"], fmt)
+        if t >= now: next_low = t; break
+    if not next_low: next_low = datetime.strptime(lows[-1]["t"], fmt)
+    return {"start": next_low.isoformat(), "end": (next_low + timedelta(hours=2)).isoformat()}
+
+def parse_low_to_rising_window_from_hourly(preds):
+    if not preds: return None
+    fmt = "%Y-%m-%d %H:%M"; now = datetime.now()
+    series = []
+    for p in preds:
+        try:
+            t = datetime.strptime(p["t"], fmt); v = float(p["v"])
+            series.append((t, v))
+        except: pass
+    if len(series) < 3: return None
+    mins = []
+    for i in range(1, len(series)-1):
+        _, v0 = series[i-1]; t1, v1 = series[i]; _, v2 = series[i+1]
+        if v1 <= v0 and v1 <= v2: mins.append(t1)
+    next_low = None
+    for t in mins:
+        if t >= now: next_low = t; break
+    if not next_low: next_low = mins[-1]
+    return {"start": next_low.isoformat(), "end": (next_low + timedelta(hours=2)).isoformat()}
 
 @app.get("/optimal-window")
 def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
@@ -353,10 +417,7 @@ def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
     if window.get("start"):
         wave_height = cond.get("wave_height_ft") if cond else None
         if wave_height is not None and wave_height > 3:
-            if offshore:
-                note = "Go shred, it's good!"
-            else:
-                note = "Go to work."
+            note = "Go shred, it's good!" if offshore else "Go to work."
         else:
             note = "Surf's small, maybe work."
     else:
