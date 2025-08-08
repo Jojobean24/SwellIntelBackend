@@ -9,13 +9,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # ====== Config ======
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional; if missing we use placeholder
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional; placeholder used if missing or errors
 STATIC_DIR = "static"
 AI_CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-app = FastAPI(title="Swell Intel Backend", version="1.2")
+app = FastAPI(title="Swell Intel Backend", version="1.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,7 +80,7 @@ def _float_or_none(x: str) -> Optional[float]:
 def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     """
     Parse NDBC realtime2 text using header names, tolerant to 'MM'.
-    Returns dict with wave_height_ft, wave_period_s (APD or DPD), wind_speed_mph if any present.
+    Returns dict with wave_height_ft, wave_period_s (APD or DPD), wind_speed_mph if available.
     Returns None only if *no* usable wave height exists.
     """
     url = f"https://www.ndbc.noaa.gov/data/realtime2/{station_id}.txt"
@@ -94,11 +94,9 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
 
     header = lines[0].split()
     latest = lines[2].split()
-
-    # Map header -> index
     idx = {h: i for i, h in enumerate(header)}
 
-    # Need at least WVHT to consider it "wave" data
+    # Need at least wave height to consider it usable
     if "WVHT" not in idx:
         return None
 
@@ -111,7 +109,7 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     dpd = _float_or_none(latest[idx["DPD"]]) if "DPD" in idx else None
     period_s = apd if apd is not None else dpd
 
-    # Wind speed heuristic: m/s (typical) vs knots (some platforms)
+    # Wind speed: many feeds are m/s, some knots; heuristic conversion
     wspd_raw = _float_or_none(latest[idx["WSPD"]]) if "WSPD" in idx else None
     if wspd_raw is None:
         wind_mph = None
@@ -127,8 +125,9 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
 
 def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int = 300):
     """
-    Prefer numeric NDBC buoys, then others. Try many nearest stations and return
-    the first with usable wave height. If none, fallback to nearest (no waves).
+    Prefer numeric NDBC buoys (IDs like '41012'), then others.
+    Try many nearest stations and return the first with usable wave height.
+    If none report waves, fallback to nearest (no waves).
     """
     stations = get_noaa_stations()
     stations.sort(key=lambda s: haversine(lat, lon, s["lat"], s["lon"]))
@@ -150,7 +149,7 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
         if cond:
             return s, cond
 
-    return stations[0], None  # fallback
+    return stations[0], None  # fallback only
 
 
 def stability_ai_image(prompt: str) -> Optional[str]:
@@ -160,11 +159,15 @@ def stability_ai_image(prompt: str) -> Optional[str]:
         return None
 
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
-    headers = {"Authorization": f"Bearer {STABILITY_API_KEY}"}
+    headers = {
+        "Authorization": f"Bearer {STABILITY_API_KEY}",
+        "Accept": "image/*",  # REQUIRED by Stability; fixes 400 'accept' error
+    }
     files = {
         "prompt": (None, prompt),
         "output_format": (None, "png"),
         "aspect_ratio": (None, "16:9"),
+        # "style_preset": (None, "photographic"),  # optional stylistic nudge
     }
 
     try:
@@ -203,7 +206,9 @@ def summary(
         cond = fetch_noaa_conditions(station_id)
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
         if not cond:
+            print(f"[summary] Override {station_id} -> no wave data")
             return {"summary": f"No live wave data on station {station_id}.", "station": station}
+
         parts = [f"{cond['wave_height_ft']} ft"]
         if cond.get("wave_period_s") is not None:
             parts.append(f"@ {cond['wave_period_s']} s")
@@ -252,7 +257,11 @@ def forecast_image(
 
     if not cond:
         print(f"[image] No wave data from candidates. Fallback: {station['id']} {station.get('name','')}")
-        data = {"summary": "No live wave data available nearby.", "imageUrl": make_abs(request, "/static/forecast.jpg"), "station": station}
+        data = {
+            "summary": "No live wave data available nearby.",
+            "imageUrl": make_abs(request, "/static/forecast.jpg"),
+            "station": station,
+        }
         if key:
             _ai_cache[key] = {"data": data, "ts": now_ts}
         return data
