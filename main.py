@@ -1,4 +1,3 @@
-
 import os
 import math
 import requests
@@ -6,9 +5,8 @@ from datetime import datetime
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
 
-# Read Stability.ai key from Render Environment
+# Read API key from Render Environment
 STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
 if not STABILITY_API_KEY:
     raise RuntimeError("Missing STABILITY_API_KEY in environment variables.")
@@ -25,7 +23,10 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# --- Helpers ---
+# --- Simple cache for AI image results ---
+cache = {}  # {(lat_rounded, lon_rounded): {"data": {...}, "ts": timestamp}}
+
+# --- Helper functions ---
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371  # km
     dlat = math.radians(lat2 - lat1)
@@ -35,7 +36,6 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 def get_noaa_stations():
-    """Pull the latest NOAA station list."""
     url = "https://www.ndbc.noaa.gov/activestations.xml"
     r = requests.get(url, timeout=10)
     from xml.etree import ElementTree
@@ -64,10 +64,8 @@ def fetch_noaa_conditions(station_id):
     lines = r.text.splitlines()
     if len(lines) < 3:
         return None
-    # Latest observation is line 2 (index 2)
-    cols = lines[0].split()
-    data = lines[2].split()
     try:
+        data = lines[2].split()
         wave_height_m = float(data[8])
         wave_period_s = float(data[9])
         wind_speed_kt = float(data[6])
@@ -81,20 +79,16 @@ def fetch_noaa_conditions(station_id):
 
 def stability_ai_image(prompt):
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
-    headers = {
-        "Authorization": f"Bearer {STABILITY_API_KEY}"
-    }
+    headers = {"Authorization": f"Bearer {STABILITY_API_KEY}"}
     files = {
         "prompt": (None, prompt),
         "output_format": (None, "png"),
         "aspect_ratio": (None, "16:9")
     }
-    r = requests.post(url, headers=headers, files=files, timeout=30)
+    r = requests.post(url, headers=headers, files=files, timeout=60)
     if r.status_code != 200:
         print("Stability API error:", r.text)
         return None
-    from base64 import b64encode
-    # Stability returns binary image — we'll save to /static for now
     filename = f"static/surf_{int(datetime.utcnow().timestamp())}.png"
     with open(filename, "wb") as f:
         f.write(r.content)
@@ -118,6 +112,13 @@ def summary(lat: float, lon: float):
 
 @app.get("/forecast-image")
 def forecast_image(lat: float, lon: float):
+    key = (round(lat, 3), round(lon, 3))
+    now_ts = datetime.utcnow().timestamp()
+
+    # Serve from cache if fresh
+    if key in cache and now_ts - cache[key]['ts'] < 1800:  # 30 minutes
+        return cache[key]['data']
+
     station = find_nearest_station(lat, lon)
     cond = fetch_noaa_conditions(station["id"])
     if not cond:
@@ -127,10 +128,7 @@ def forecast_image(lat: float, lon: float):
     prompt = f"Photorealistic surf scene at {station['name']}, waves {cond['wave_height_ft']} ft at {cond['wave_period_s']} sec, wind {cond['wind_speed_mph']} mph"
 
     image_path = stability_ai_image(prompt) or "/static/forecast.jpg"
+    data = {"summary": summary_text, "imageUrl": image_path, "station": station}
 
-    return {
-        "summary": summary_text,
-        "imageUrl": image_path,
-        "station": station
-    }
-
+    cache[key] = {"data": data, "ts": now_ts}
+    return data
