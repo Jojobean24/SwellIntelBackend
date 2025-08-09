@@ -1,25 +1,37 @@
 import os
+import io
 import math
+import base64
 import requests
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
 
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
+from PIL import Image, ExifTags
+from dateutil import parser as dtparse
 
 # =========================
-# Config
+# Config & env
 # =========================
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional; if missing we use placeholder
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional for AI image
 STATIC_DIR = "static"
 AI_CACHE_TTL_SECONDS = 1800  # 30 min
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-app = FastAPI(title="Swell Intel Backend", version="2.5.0")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+BUCKET_PHOTOS = os.getenv("SUPABASE_BUCKET_PHOTOS", "photos")
+BUCKET_PREVIEWS = os.getenv("SUPABASE_BUCKET_PREVIEWS", "previews")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    print("[supabase] WARN: missing SUPABASE_URL or SUPABASE_SERVICE_KEY")
+
+app = FastAPI(title="Swell Intel Backend", version="3.0.0")
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -27,24 +39,20 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 _ai_cache: Dict[Tuple[float, float], Dict] = {}
 
 # =========================
-# Utils
+# Helpers
 # =========================
+def make_abs(request: Request, path: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    return f"{base}{path if path.startswith('/') else '/' + path}"
+
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+
 def haversine(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-def _float_or_none(x):
-    try:
-        if x is None: return None
-        if isinstance(x, str) and x.upper() == "MM": return None
-        return float(x)
-    except:
-        return None
-
-def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 def deg_to_cardinal(deg: Optional[float]) -> Optional[str]:
     if deg is None: return None
@@ -54,18 +62,22 @@ def deg_to_cardinal(deg: Optional[float]) -> Optional[str]:
 
 def is_offshore_east_coast(wdir: Optional[float]) -> bool:
     if wdir is None: return False
-    return 210 <= (wdir % 360) <= 330  # W quadrant ~ offshore
+    return 210 <= (wdir % 360) <= 330
 
 def is_onshore_east_coast(wdir: Optional[float]) -> bool:
     if wdir is None: return False
-    return 30 <= (wdir % 360) <= 150   # E quadrant ~ onshore
+    return 30 <= (wdir % 360) <= 150
 
-def make_abs(request: Request, path: str) -> str:
-    base = str(request.base_url).rstrip("/")
-    return f"{base}{path if path.startswith('/') else '/' + path}"
+def _float_or_none(x):
+    try:
+        if x is None: return None
+        if isinstance(x, str) and x.upper() == "MM": return None
+        return float(x)
+    except:
+        return None
 
 # =========================
-# NOAA Buoy (live)
+# NOAA + Open-Meteo (existing surf logic)
 # =========================
 def get_noaa_stations():
     url = "https://www.ndbc.noaa.gov/activestations.xml"
@@ -129,9 +141,6 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
         if cond: return s, cond
     return stations[0], None
 
-# =========================
-# Open‑Meteo (current + marine)
-# =========================
 def fetch_current_weather(lat: float, lon: float) -> Optional[dict]:
     url = (
         "https://api.open-meteo.com/v1/forecast?"
@@ -208,7 +217,7 @@ def fetch_weekly(lat: float, lon: float, days: int = 5):
             for i, d in enumerate(dates):
                 h_m = hmean[i] if i < len(hmean) and hmean[i] is not None else (hmax[i] if i < len(hmax) else 0.5)
                 h_ft = round((h_m or 0) * 3.281, 1)
-                h_ft_adj = max(h_ft - 1.0, 0.0)  # Jacksonville realism
+                h_ft_adj = max(h_ft - 1.0, 0.0)
                 ws = wspd[i] if i < len(wspd) else None
                 wd = wdir[i] if i < len(wdir) else None
                 offshore = is_offshore_east_coast(wd)
@@ -230,43 +239,13 @@ def fetch_weekly(lat: float, lon: float, days: int = 5):
                     "summary": f"{round(h_ft_adj,1)} ft, wind {round((ws or 0)*0.621371,1) if ws is not None else '--'} mph {deg_to_cardinal(wd) or '--'}",
                 })
             return out
-
-        # Fallback if marine API empty
-        w2 = requests.get(
-            f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=wind_speed_10m_max,wind_direction_10m_dominant&timezone=auto",
-            timeout=15
-        ).json()
-        dates2 = (w2.get("daily", {}) or {}).get("time", [])[:days]
-        wspd2  = (w2.get("daily", {}) or {}).get("wind_speed_10m_max", [])[:days]
-        wdir2  = (w2.get("daily", {}) or {}).get("wind_direction_10m_dominant", [])[:days]
-        out2 = []
-        for i, d in enumerate(dates2):
-            wd = wdir2[i] if i < len(wdir2) else None
-            ws = wspd2[i] if i < len(wspd2) else None
-            base_ft = 2.0 if wd is not None else 1.5
-            h_ft_adj = max(base_ft - 1.0, 0.5)
-            offshore = is_offshore_east_coast(wd)
-            stars = 1 + (1 if h_ft_adj > 1 else 0) + (1 if offshore else 0)
-            stars = clamp(stars, 1, 5)
-            out2.append({
-                "date": d,
-                "wave_height_ft_adj": round(h_ft_adj,1),
-                "wave_period_s_max": None,
-                "wind_speed_mph_max": round((ws or 0) * 0.621371, 1) if ws is not None else None,
-                "wind_dir_deg_dom": wd,
-                "wind_dir_txt_dom": deg_to_cardinal(wd) if wd is not None else None,
-                "offshore": offshore,
-                "stars": stars,
-                "summary": f"{round(h_ft_adj,1)} ft est, wind {round((ws or 0)*0.621371,1) if ws is not None else '--'} mph {deg_to_cardinal(wd) or '--'}",
-            })
-        return out2
-
+        return []
     except Exception as e:
         print("[weekly] error:", e)
         return []
 
 # =========================
-# Image (Stability or placeholder) — now biased small & messy
+# Stability AI image (kept, with messy bias)
 # =========================
 def stability_ai_image(prompt: str):
     if not STABILITY_API_KEY:
@@ -275,7 +254,7 @@ def stability_ai_image(prompt: str):
     headers = {"Authorization": f"Bearer {STABILITY_API_KEY}", "Accept": "image/*"}
     files = {
         "prompt": (None, prompt),
-        "model": (None, "sd3.5"),  # use sd3.5-large if you have it
+        "model": (None, "sd3.5"),
         "output_format": (None, "png"),
         "aspect_ratio": (None, "16:9"),
     }
@@ -291,65 +270,141 @@ def stability_ai_image(prompt: str):
         return None, f"Exception: {e}"
 
 # =========================
-# Tides (strike window)
+# Supabase helpers
 # =========================
-def _noaa_get(url: str):
+def sb_headers(json=True):
+    h = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    }
+    if json: h["Content-Type"] = "application/json"
+    return h
+
+def supabase_storage_upload(bucket: str, path: str, data: bytes, content_type: str) -> str:
+    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+    r = requests.post(url, headers=headers, data=data, timeout=60)
+    if r.status_code not in (200, 201):
+        raise HTTPException(500, f"Supabase upload failed: {r.status_code} {r.text[:200]}")
+    # Public URL pattern for storage (previews should be in a public bucket)
+    return f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{path}"
+
+def supabase_storage_upload_private(bucket: str, path: str, data: bytes, content_type: str) -> str:
+    # Upload to private bucket (no /public in URL)
+    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+    r = requests.post(url, headers=headers, data=data, timeout=60)
+    if r.status_code not in (200, 201):
+        raise HTTPException(500, f"Supabase upload failed: {r.status_code} {r.text[:200]}")
+    # Return a storage path (not public). You can sign URLs later.
+    return f"{bucket}/{path}"
+
+def supabase_insert(table: str, payload: dict) -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    headers = sb_headers(json=True)
+    headers["Prefer"] = "return=representation"
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    if r.status_code not in (200, 201):
+        raise HTTPException(500, f"Supabase insert failed: {r.status_code} {r.text[:200]}")
+    return r.json()[0] if isinstance(r.json(), list) and r.json() else r.json()
+
+def supabase_select_photos_today(limit: int = 500) -> List[dict]:
+    today = date.today().isoformat()
+    # photos created today (UTC)
+    url = f"{SUPABASE_URL}/rest/v1/photos?select=*&created_at=gte.{today}T00:00:00Z&limit={limit}"
+    r = requests.get(url, headers=sb_headers(json=False), timeout=30)
+    if r.status_code != 200:
+        print("[supabase] select photos failed:", r.status_code, r.text[:200])
+        return []
+    return r.json()
+
+# =========================
+# Uploader utils
+# =========================
+def exif_to_dict(img: Image.Image) -> dict:
+    out = {}
     try:
-        r = requests.get(url, timeout=12); r.raise_for_status(); return r.json()
-    except Exception as e:
-        print("[tides] fetch error:", e); return None
+        raw = img._getexif() or {}
+        for k, v in raw.items():
+            tag = ExifTags.TAGS.get(k, str(k))
+            out[tag] = v
+    except Exception:
+        pass
+    return out
 
-def fetch_todays_hilo(tide_station: str):
-    today = date.today().strftime("%Y%m%d")
-    url = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
-           f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
-           f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=hilo&format=json")
-    j = _noaa_get(url); return j.get("predictions") if j else None
+def exif_get_datetime(exif: dict) -> Optional[datetime]:
+    for key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+        if key in exif:
+            try:
+                # EXIF format 'YYYY:MM:DD HH:MM:SS'
+                s = exif[key]
+                s = s.replace("-", ":") if "-" in s and ":" not in s[:10] else s
+                dt = datetime.strptime(s, "%Y:%m:%d %H:%M:%S")
+                return dt.replace(tzinfo=timezone.utc)  # assume UTC if no tz
+            except Exception:
+                try:
+                    return dtparse.parse(exif[key])
+                except Exception:
+                    pass
+    return None
 
-def fetch_todays_hourly(tide_station: str):
-    today = date.today().strftime("%Y%m%d")
-    url = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
-           f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
-           f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=h&format=json")
-    j = _noaa_get(url); return j.get("predictions") if j else None
+def exif_get_gps(exif: dict) -> Tuple[Optional[float], Optional[float]]:
+    gps = exif.get("GPSInfo")
+    if not gps: return None, None
 
-def parse_low_to_rising_window_from_hilo(preds):
-    if not preds: return None
-    fmt = "%Y-%m-%d %H:%M"; now = datetime.now()
-    lows = [p for p in preds if p.get("type") == "L"]
-    if not lows: return None
-    next_low = None
-    for p in lows:
-        t = datetime.strptime(p["t"], fmt)
-        if t >= now: next_low = t; break
-    if not next_low: next_low = datetime.strptime(lows[-1]["t"], fmt)
-    return {"start": next_low.isoformat(), "end": (next_low + timedelta(hours=2)).isoformat()}
-
-def parse_low_to_rising_window_from_hourly(preds):
-    if not preds: return None
-    fmt = "%Y-%m-%d %H:%M"; now = datetime.now()
-    series = []
-    for p in preds:
+    def _conv(val):
         try:
-            t = datetime.strptime(p["t"], fmt); v = float(p["v"]); series.append((t, v))
-        except: pass
-    if len(series) < 3: return None
-    mins = []
-    for i in range(1, len(series)-1):
-        _, v0 = series[i-1]; t1, v1 = series[i]; _, v2 = series[i+1]
-        if v1 <= v0 and v1 <= v2: mins.append(t1)
-    next_low = None
-    for t in mins:
-        if t >= now: next_low = t; break
-    if not next_low: next_low = mins[-1]
-    return {"start": next_low.isoformat(), "end": (next_low + timedelta(hours=2)).isoformat()}
+            n, d = val
+            return float(n) / float(d)
+        except Exception:
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+    def _dms_to_deg(d, m, s, ref):
+        deg = _conv(d) + _conv(m)/60.0 + _conv(s)/3600.0
+        if ref in ["S", "W"]: deg = -deg
+        return deg
+
+    lat = lon = None
+    try:
+        lat = _dms_to_deg(gps[2][0], gps[2][1], gps[2][2], gps[1])
+        lon = _dms_to_deg(gps[4][0], gps[4][1], gps[4][2], gps[3])
+    except Exception:
+        pass
+    return lat, lon
+
+def make_preview(image_bytes: bytes, max_w: int = 800) -> bytes:
+    im = Image.open(io.BytesIO(image_bytes))
+    im = im.convert("RGB")
+    w, h = im.size
+    if w > max_w:
+        nh = int(h * (max_w / w))
+        im = im.resize((max_w, nh), Image.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=82)
+    return buf.getvalue()
 
 # =========================
-# Routes
+# Routes — health
 # =========================
 @app.get("/health")
 def health(): return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
+# =========================
+# Routes — forecast & image (kept, messy bias)
+# =========================
 @app.get("/summary")
 def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
     if station_id:
@@ -360,7 +415,6 @@ def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
         station, cond = find_nearest_station_with_waves(lat, lon)
         if not cond: return {"summary": "No live wave data available nearby.", "station": station}
 
-    # Jax realism: subtract 1.0 ft in text
     h_adj = max((cond.get("wave_height_ft") or 0) - 1.0, 0.0)
     parts = [f"{h_adj:.1f} ft (adj)"]
     if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
@@ -377,7 +431,6 @@ def forecast_image(request: Request, lat: float, lon: float, station_id: Optiona
         if not force and cache_key in _ai_cache and now_ts - _ai_cache[cache_key]["ts"] < AI_CACHE_TTL_SECONDS:
             return _ai_cache[cache_key]["data"]
 
-    # Buoy + weather
     if station_id:
         cond = fetch_noaa_conditions(station_id)
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
@@ -398,10 +451,8 @@ def forecast_image(request: Request, lat: float, lon: float, station_id: Optiona
         if cache_key: _ai_cache[cache_key] = {"data": data, "ts": now_ts}
         return data
 
-    # Adjusted realism for Jax AI image: subtract 1.5 ft (looks smaller/softer) and always bias messy/choppy
     h_adj = max((cond.get("wave_height_ft") or 0) - 1.5, 0.0)
-    wdir = cond.get("wind_dir_deg")
-    wtxt = cond.get("wind_dir_txt") or ""
+    wdir = cond.get("wind_dir_deg"); wtxt = cond.get("wind_dir_txt") or ""
     ws = cond.get("wind_speed_mph") or 0
 
     parts = [f"{h_adj:.1f} ft (adj)"]
@@ -409,9 +460,7 @@ def forecast_image(request: Request, lat: float, lon: float, station_id: Optiona
     if ws: parts.append(f"wind {ws} mph {wtxt}")
     base_summary = ", ".join(parts) + f" — {station['name']}"
 
-    # Explicit messy surface — no surfer/glamour language
     surface = "wind‑blown chop, short‑period waves, disorganized peaks, whitewater, lumpy surface"
-
     prompt = (
         f"Realistic ocean photograph near {station['name']}; "
         f"{weather_desc}; "
@@ -438,125 +487,189 @@ def forecast_image(request: Request, lat: float, lon: float, station_id: Optiona
     if cache_key: _ai_cache[cache_key] = {"data": data, "ts": now_ts}
     return data
 
-@app.get("/wind")
-def wind(lat: float, lon: float):
-    station, cond = find_nearest_station_with_waves(lat, lon)
-    # Fallback to Open‑Meteo if buoy missing wind
-    ow = fetch_current_weather(lat, lon) or {}
-    om_wspd = ow.get("wind10m")
-    om_wdir = ow.get("winddir10m")
-    if not cond:
-        return {
-            "station": station,
-            "wind_speed_mph": round((om_wspd or 0), 1) if om_wspd is not None else None,
-            "wind_dir_deg": om_wdir,
-            "wind_dir_txt": deg_to_cardinal(om_wdir) if om_wdir is not None else None,
-            "offshore": is_offshore_east_coast(om_wdir),
-            "source": "open-meteo",
-        }
-    wspd = cond.get("wind_speed_mph")
-    wdir = cond.get("wind_dir_deg")
-    if wspd is None or wdir is None:
-        wspd = round((om_wspd or 0), 1) if om_wspd is not None else None
-        wdir = om_wdir
-        src = "open-meteo"
-    else:
-        src = "noaa"
-    return {
-        "station": station,
-        "wind_speed_mph": wspd,
-        "wind_dir_deg": wdir,
-        "wind_dir_txt": deg_to_cardinal(wdir) if wdir is not None else None,
-        "offshore": is_offshore_east_coast(wdir),
-        "source": src,
-    }
-
-@app.get("/optimal-window")
-def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
-    # Tide window helpers
-    def _get(url: str):
-        try:
-            r = requests.get(url, timeout=12); r.raise_for_status(); return r.json()
-        except Exception as e:
-            print("[tides] fetch error:", e); return None
-    def _hilo(ts: str):
-        today = date.today().strftime("%Y%m%d")
-        url = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
-               f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
-               f"&datum=MLLW&station={ts}&time_zone=lst_ldt&units=english&interval=hilo&format=json")
-        j = _get(url); return j.get("predictions") if j else None
-    def _hourly(ts: str):
-        today = date.today().strftime("%Y%m%d")
-        url = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
-               f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
-               f"&datum=MLLW&station={ts}&time_zone=lst_ldt&units=english&interval=h&format=json")
-        j = _get(url); return j.get("predictions") if j else None
-    def _from_hilo(preds):
-        if not preds: return None
-        fmt = "%Y-%m-%d %H:%M"; now = datetime.now()
-        lows = [p for p in preds if p.get("type") == "L"]
-        if not lows: return None
-        nxt = None
-        for p in lows:
-            t = datetime.strptime(p["t"], fmt)
-            if t >= now: nxt = t; break
-        if not nxt: nxt = datetime.strptime(lows[-1]["t"], fmt)
-        return {"start": nxt.isoformat(), "end": (nxt + timedelta(hours=2)).isoformat()}
-    def _from_hourly(preds):
-        if not preds: return None
-        fmt = "%Y-%m-%d %H:%M"; now = datetime.now()
-        series = []
-        for p in preds:
-            try: t = datetime.strptime(p["t"], fmt); v = float(p["v"]); series.append((t,v))
-            except: pass
-        if len(series) < 3: return None
-        mins = []
-        for i in range(1,len(series)-1):
-            _, v0 = series[i-1]; t1, v1 = series[i]; _, v2 = series[i+1]
-            if v1 <= v0 and v1 <= v2: mins.append(t1)
-        nxt = None
-        for t in mins:
-            if t >= now: nxt = t; break
-        if not nxt: nxt = mins[-1]
-        return {"start": nxt.isoformat(), "end": (nxt + timedelta(hours=2)).isoformat()}
-
-    window = _from_hilo(_hilo(tide_station)) or _from_hourly(_hourly(tide_station)) or {"start": None, "end": None}
-
-    station, cond = find_nearest_station_with_waves(lat, lon)
-    # Prefer buoy wind; fallback to Open‑Meteo so UI never blank
-    ow = fetch_current_weather(lat, lon) or {}
-    wspd = cond.get("wind_speed_mph") if cond else None
-    wdir = cond.get("wind_dir_deg") if cond else None
-    if wspd is None or wdir is None:
-        wspd = round((ow.get("wind10m") or 0), 1) if ow.get("wind10m") is not None else None
-        wdir = ow.get("winddir10m")
-    offshore = is_offshore_east_coast(wdir)
-
-    # Jax realism note logic (uses −1.0 ft for user-facing call)
-    h_adj = None
-    if cond and cond.get("wave_height_ft") is not None:
-        h_adj = max(cond["wave_height_ft"] - 1.0, 0.0)
-    if window.get("start"):
-        if h_adj is not None and h_adj > 3:
-            note = "Go shred, it's good!" if offshore else "Go to work."
-        else:
-            note = "Surf's small, maybe work."
-    else:
-        note = "No explicit low found; check tide station or try another nearby."
-
-    return {
-        "tide_station": tide_station,
-        "window": window,
-        "wind": {
-            "dir_deg": wdir,
-            "dir_txt": deg_to_cardinal(wdir) if wdir is not None else None,
-            "speed_mph": wspd,
-            "offshore": offshore,
-        },
-        "buoy_station": station,
-        "note": note,
-    }
-
 @app.get("/weekly")
 def weekly(lat: float, lon: float, days: int = 5):
     return {"days": fetch_weekly(lat, lon, days)}
+
+# =========================
+# Uploader page & endpoints
+# =========================
+UPLOADER_HTML = """<!doctype html>
+<html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Swell Intel — Photo Uploader</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial;background:#071B2F;color:#E5F0FF;margin:0;padding:24px}
+ .card{max-width:720px;margin:0 auto;background:#0B2C4E;border:1px solid #123B66;border-radius:12px;padding:16px}
+ h1{margin:0 0 12px;font-size:20px}
+ label{display:block;margin-top:10px;font-size:14px;color:#9FC5FF}
+ input,button{margin-top:6px}
+ .btn{background:#2DD4BF;border:none;color:#062030;font-weight:700;padding:10px 14px;border-radius:8px;cursor:pointer}
+ .muted{color:#9FC5FF;font-size:12px}
+</style>
+</head><body>
+  <div class="card">
+    <h1>Photo Uploader</h1>
+    <p class="muted">Drop JPEG/PNG from your shoot. We’ll read EXIF for time & GPS (if present), create previews, and store them.</p>
+    <form id="f" enctype="multipart/form-data" method="post" action="/photos/upload">
+      <label>Photographer email/handle (for payouts/credit):</label>
+      <input name="photographer" type="text" placeholder="you@example.com" required />
+      <label>Fallback latitude (if EXIF GPS missing):</label>
+      <input name="fallback_lat" type="text" placeholder="30.3200" />
+      <label>Fallback longitude (if EXIF GPS missing):</label>
+      <input name="fallback_lon" type="text" placeholder="-81.4000" />
+      <label>Fallback Field of View (deg, optional):</label>
+      <input name="fov_deg" type="text" placeholder="78" />
+      <label>Select images:</label>
+      <input name="files" type="file" accept="image/*" multiple required />
+      <div style="margin-top:12px">
+        <button class="btn" type="submit">Upload</button>
+      </div>
+    </form>
+    <p id="res" class="muted"></p>
+  </div>
+<script>
+  const form = document.getElementById('f');
+  const resEl = document.getElementById('res');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    resEl.textContent = 'Uploading...';
+    const fd = new FormData(form);
+    try {
+      const r = await fetch('/photos/upload', { method: 'POST', body: fd });
+      const j = await r.json();
+      resEl.textContent = 'Done: ' + JSON.stringify(j, null, 2);
+    } catch (err) {
+      resEl.textContent = 'Error: ' + err.message;
+    }
+  });
+</script>
+</body></html>"""
+
+@app.get("/upload", response_class=HTMLResponse)
+def upload_page():
+    return HTMLResponse(content=UPLOADER_HTML, status_code=200)
+
+@app.post("/photos/upload")
+async def photos_upload(
+    request: Request,
+    photographer: str = Form(...),
+    fallback_lat: Optional[str] = Form(None),
+    fallback_lon: Optional[str] = Form(None),
+    fov_deg: Optional[str] = Form(None),
+    files: List[UploadFile] = File(...)
+):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise HTTPException(500, "Supabase not configured")
+
+    out = []
+    for uf in files:
+        content = await uf.read()
+        # Preview
+        preview_jpg = make_preview(content, max_w=800)
+
+        # EXIF
+        try:
+            img = Image.open(io.BytesIO(content))
+        except Exception:
+            raise HTTPException(400, f"Unsupported image: {uf.filename}")
+        exif = exif_to_dict(img)
+        dt = exif_get_datetime(exif) or datetime.utcnow().replace(tzinfo=timezone.utc)
+        lat, lon = exif_get_gps(exif)
+
+        # Camera model → rough FOV if provided (optional)
+        cam_model = exif.get("Model") or exif.get("Make") or ""
+        fov = None
+        try:
+            fov = float(fov_deg) if fov_deg else None
+        except:
+            fov = None
+
+        if lat is None or lon is None:
+            try:
+                if fallback_lat and fallback_lon:
+                    lat = float(fallback_lat); lon = float(fallback_lon)
+            except:
+                pass
+
+        # Storage paths
+        ts = int(dt.timestamp())
+        safe_name = os.path.basename(uf.filename).replace(" ", "_")
+        photo_path = f"{photographer}/{ts}_{safe_name}"
+        preview_path = f"{photographer}/{ts}_{os.path.splitext(safe_name)[0]}_preview.jpg"
+
+        # Upload to Supabase Storage
+        url_preview = supabase_storage_upload(BUCKET_PREVIEWS, preview_path, preview_jpg, "image/jpeg")
+        # Private full image (store path; you can sign URL later)
+        _full_path = supabase_storage_upload_private(BUCKET_PHOTOS, photo_path, content, uf.content_type or "application/octet-stream")
+        url_full = _full_path  # stored as bucket/path
+
+        # Insert row
+        row = supabase_insert("photos", {
+            "photographer": photographer,
+            "taken_at": dt.isoformat(),
+            "lat": lat,
+            "lon": lon,
+            "fov_deg": fov,
+            "url_preview": url_preview,
+            "url_full": url_full,
+        })
+        out.append(row)
+
+    return {"inserted": len(out), "items": out}
+
+# =========================
+# Sessions + Matches
+# =========================
+@app.post("/sessions")
+def create_session(
+    user_email: str = Form(...),
+    start_time: str = Form(...),  # ISO
+    end_time: str = Form(...),    # ISO
+    center_lat: float = Form(...),
+    center_lon: float = Form(...),
+    source: str = Form("manual")
+):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise HTTPException(500, "Supabase not configured")
+    try:
+        st = dtparse.parse(start_time)
+        et = dtparse.parse(end_time)
+    except Exception:
+        raise HTTPException(400, "Invalid time format")
+    row = supabase_insert("sessions", {
+        "user_email": user_email,
+        "start_time": st.isoformat(),
+        "end_time": et.isoformat(),
+        "center_lat": center_lat,
+        "center_lon": center_lon,
+        "source": source
+    })
+    return {"ok": True, "session": row}
+
+@app.get("/matches/today")
+def matches_today(lat: float, lon: float, radius_m: int = 400):
+    """Return photos shot today within radius of given location."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise HTTPException(500, "Supabase not configured")
+    photos = supabase_select_photos_today(limit=800)
+    hits = []
+    for p in photos:
+        p_lat = p.get("lat"); p_lon = p.get("lon"); t = p.get("taken_at")
+        if p_lat is None or p_lon is None or not t: continue
+        try:
+            d = haversine(lat, lon, float(p_lat), float(p_lon)) * 1000
+        except Exception:
+            continue
+        if d <= radius_m:
+            hits.append({
+                "photo_id": p.get("id"),
+                "url_preview": p.get("url_preview"),
+                "taken_at": t,
+                "distance_m": round(d, 1),
+                "confidence": 0.8 if d < radius_m/2 else 0.6,  # naive score
+                "photographer": p.get("photographer"),
+            })
+    # sort closest first
+    hits.sort(key=lambda x: (x["distance_m"]))
+    return {"count": len(hits), "items": hits}
