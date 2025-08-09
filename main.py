@@ -1,7 +1,7 @@
 import os
 import math
 import requests
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Dict, Tuple, Optional
 
 from fastapi import FastAPI, Query, Request, HTTPException
@@ -15,7 +15,7 @@ AI_CACHE_TTL_SECONDS = 1800  # 30 minutes
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 # --------- App ----------
-app = FastAPI(title="Swell Intel Backend", version="1.7.0")
+app = FastAPI(title="Swell Intel Backend", version="1.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,10 +50,11 @@ def deg_to_cardinal(deg: float) -> str:
     return dirs[ix]
 
 def is_offshore_east_coast(wdir: Optional[float]) -> bool:
-    # Heuristic for US East Coast: W quadrant is roughly offshore (210–330)
+    # Heuristic for US East Coast: W quadrant ~ offshore (210–330)
     if wdir is None: return False
     return 210 <= (wdir % 360) <= 330
 
+# --------- NOAA buoy data ----------
 def get_noaa_stations():
     url = "https://www.ndbc.noaa.gov/activestations.xml"
     r = requests.get(url, timeout=12)
@@ -95,11 +96,8 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     if wvht_m is None:
         return None
 
-    wind_mph = None
-    if wspd_raw is not None:
-        # NDBC usually reports knots; convert to mph
-        wind_mph = round(wspd_raw * 1.15078, 1)
-
+    # assume knots → mph
+    wind_mph = round(wspd_raw * 1.15078, 1) if wspd_raw is not None else None
     period_s = apd if apd is not None else dpd
 
     return {
@@ -136,6 +134,82 @@ def make_abs(request: Request, path: str) -> str:
     base = str(request.base_url).rstrip("/")
     return f"{base}{path if path.startswith('/') else '/' + path}"
 
+# --------- Open‑Meteo (current weather) ----------
+def fetch_current_weather(lat: float, lon: float) -> Optional[dict]:
+    """
+    Free, no key. Returns {wcode, cloud_cover, precipitation, wind10m, winddir10m, is_day}.
+    """
+    url = (
+        "https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat}&longitude={lon}"
+        "&current=precipitation,cloud_cover,weather_code,wind_speed_10m,wind_direction_10m,is_day"
+        "&timezone=auto"
+    )
+    try:
+        r = requests.get(url, timeout=12); r.raise_for_status()
+        cur = r.json().get("current", {})
+        return {
+            "wcode": cur.get("weather_code"),
+            "cloud_cover": cur.get("cloud_cover"),
+            "precip": cur.get("precipitation"),
+            "wind10m": cur.get("wind_speed_10m"),
+            "winddir10m": cur.get("wind_direction_10m"),
+            "is_day": cur.get("is_day"),
+        }
+    except Exception as e:
+        print("[weather] fetch error:", e)
+        return None
+
+def describe_weather(w: Optional[dict]) -> str:
+    """
+    Turn weather code + cloud/precip into prompt words.
+    """
+    if not w:
+        return "clear skies"
+    code = w.get("wcode")
+    clouds = w.get("cloud_cover") or 0
+    precip = (w.get("precip") or 0)
+    is_day = w.get("is_day", 1) == 1
+
+    # map code to text (Open‑Meteo WMO codes)
+    # simplified buckets:
+    if code in (45, 48):
+        base = "foggy"
+    elif code in (51, 53, 55):
+        base = "light drizzle"
+    elif code in (61, 63):
+        base = "light rain"
+    elif code in (65,):
+        base = "heavy rain"
+    elif code in (80, 81):
+        base = "showers"
+    elif code in (82,):
+        base = "heavy showers"
+    elif code in (71, 73, 75, 77, 85, 86):
+        base = "snow"
+    elif code in (95, 96, 99):
+        base = "thunderstorm"
+    else:
+        # fall back to cloud cover
+        if clouds >= 85:
+            base = "overcast"
+        elif clouds >= 50:
+            base = "mostly cloudy"
+        elif clouds >= 20:
+            base = "partly cloudy"
+        else:
+            base = "clear skies"
+
+    # refine with precip intensity if rainy-ish
+    if "rain" in base or "shower" in base or "drizzle" in base:
+        if precip and precip >= 5:
+            base = base.replace("light", "moderate")
+        if precip and precip >= 15:
+            base = base.replace("moderate", "heavy")
+
+    time_desc = "daylight" if is_day else "night"
+    return f"{base}, {time_desc}"
+
 # --------- Stability image ----------
 def stability_ai_image(prompt: str) -> Optional[str]:
     """Generate an image with Stability if API key present; return relative /static path."""
@@ -146,14 +220,16 @@ def stability_ai_image(prompt: str) -> Optional[str]:
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
     headers = {
         "Authorization": f"Bearer {STABILITY_API_KEY}",
-        "Accept": "image/*",  # Stability requires this
+        "Accept": "image/*",  # they require this
     }
-    # IMPORTANT: use multipart/form-data
+    # multipart/form-data
     files = {
         "prompt": (None, prompt),
         "model": (None, "sd3.5-large"),
         "output_format": (None, "png"),
         "aspect_ratio": (None, "16:9"),
+        # You can add a seed for slightly more consistency:
+        # "seed": (None, "42"),
     }
     try:
         r = requests.post(url, headers=headers, files=files, timeout=60)
@@ -290,18 +366,25 @@ def forecast_image(
         if not force and cache_key in _ai_cache and now_ts - _ai_cache[cache_key]["ts"] < AI_CACHE_TTL_SECONDS:
             return _ai_cache[cache_key]["data"]
 
+    # wave/boil data
     if station_id:
         cond = fetch_noaa_conditions(station_id)
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
     else:
         station, cond = find_nearest_station_with_waves(lat, lon)
 
+    # weather data
+    weather = fetch_current_weather(lat, lon)
+    weather_desc = describe_weather(weather)
+
     if not cond:
         data = {
             "summary": "No live wave data available nearby.",
             "imageUrl": make_abs(request, "/static/forecast.jpg"),
             "station": station,
-            "imageProvider": "placeholder"
+            "imageProvider": "placeholder",
+            "weather": weather,
+            "weather_desc": weather_desc,
         }
         if cache_key:
             _ai_cache[cache_key] = {"data": data, "ts": now_ts}
@@ -310,13 +393,17 @@ def forecast_image(
     parts = [f"{cond['wave_height_ft']} ft"]
     if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
     if cond.get("wind_speed_mph") is not None: parts.append(f"wind {cond['wind_speed_mph']} mph")
-    summary_text = ", ".join(parts) + f" — {station['name']}"
+    base_summary = ", ".join(parts) + f" — {station['name']}"
 
+    # Build prompt with weather
+    # Optional extra: bias to beachbreak/point depending on your spot later
     prompt = (
-        f"Photorealistic surf scene near {station['name']}, waves {cond['wave_height_ft']} feet"
+        f"Photorealistic surf scene near {station['name']}; "
+        f"{weather_desc}; "
+        f"waves approximately {cond['wave_height_ft']} feet"
         + (f" at {cond['wave_period_s']} seconds" if cond.get('wave_period_s') is not None else "")
-        + (f", wind {cond['wind_speed_mph']} mph" if cond.get('wind_speed_mph') is not None else "")
-        + ". Natural colors, realistic ocean texture, late light, 16:9 composition, high detail."
+        + (f", surface wind about {cond['wind_speed_mph']} mph" if cond.get('wind_speed_mph') is not None else "")
+        + ". Realistic ocean texture, natural colors, cinematic lighting, 16:9 composition, high detail."
     )
 
     image_rel = stability_ai_image(prompt)
@@ -324,7 +411,15 @@ def forecast_image(
     if not image_rel:
         image_rel = "/static/forecast.jpg"
 
-    data = {"summary": summary_text, "imageUrl": make_abs(request, image_rel), "station": station, "imageProvider": provider}
+    data = {
+        "summary": base_summary,
+        "imageUrl": make_abs(request, image_rel),
+        "station": station,
+        "imageProvider": provider,
+        "weather": weather,
+        "weather_desc": weather_desc,
+        "prompt_used": prompt
+    }
     if cache_key:
         _ai_cache[cache_key] = {"data": data, "ts": now_ts}
     return data
