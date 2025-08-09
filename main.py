@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 # =========================
 # Config / Environment
 # =========================
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # set in Render → Environment
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # Set in Render → Environment
 STATIC_DIR = "static"
 AI_CACHE_TTL_SECONDS = 1800  # 30 minutes
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -19,7 +19,7 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 # =========================
 # FastAPI setup
 # =========================
-app = FastAPI(title="Swell Intel Backend", version="1.9.0")
+app = FastAPI(title="Swell Intel Backend", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -27,7 +27,7 @@ app.add_middleware(
 )
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# simple in-memory cache for AI image responses
+# Simple in-memory cache for AI image responses
 _ai_cache: Dict[Tuple[float, float], Dict] = {}
 
 # =========================
@@ -55,7 +55,7 @@ def deg_to_cardinal(deg: Optional[float]) -> Optional[str]:
     return dirs[ix]
 
 def is_offshore_east_coast(wdir: Optional[float]) -> bool:
-    # heuristic: West quadrant tends to be offshore on US East Coast
+    # Heuristic: W quadrant is offshore for most E-coast spots
     if wdir is None: return False
     return 210 <= (wdir % 360) <= 330
 
@@ -64,7 +64,7 @@ def make_abs(request: Request, path: str) -> str:
     return f"{base}{path if path.startswith('/') else '/' + path}"
 
 # =========================
-# NOAA Buoys
+# NOAA Buoy data
 # =========================
 def get_noaa_stations():
     url = "https://www.ndbc.noaa.gov/activestations.xml"
@@ -141,7 +141,7 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
     return stations[0], None
 
 # =========================
-# Open‑Meteo (current weather → prompt words)
+# Open‑Meteo weather → words
 # =========================
 def fetch_current_weather(lat: float, lon: float) -> Optional[dict]:
     url = (
@@ -202,38 +202,41 @@ def describe_weather(w: Optional[dict]) -> str:
     return f"{base}, {time_desc}"
 
 # =========================
-# Stability (AI image)
+# Stability (AI image) with debug
 # =========================
-def stability_ai_image(prompt: str) -> Optional[str]:
+def stability_ai_image(prompt: str):
+    """
+    Return (relative_path, error_message).
+    If generation succeeds: ("/static/..png", None)
+    If it fails: (None, "why it failed")
+    """
     if not STABILITY_API_KEY:
-        print("[stability] STABILITY_API_KEY not set; using placeholder.")
-        return None
+        return None, "STABILITY_API_KEY not set"
 
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
     headers = {
         "Authorization": f"Bearer {STABILITY_API_KEY}",
         "Accept": "image/*",
     }
+    # Try an accessible model first; adjust if your key isn't entitled
     files = {
         "prompt": (None, prompt),
-        "model": (None, "sd3.5-large"),
+        "model": (None, "sd3.5-large"),   # alternatives: "sd3.5", "sd3.5-large-turbo", "sdxl-1.0"
         "output_format": (None, "png"),
         "aspect_ratio": (None, "16:9"),
-        # "seed": (None, "42"),  # optional for consistency
     }
     try:
         r = requests.post(url, headers=headers, files=files, timeout=60)
         if r.status_code != 200:
-            print("[stability] API error:", r.status_code, r.text[:400])
-            return None
+            body = r.text[:300] if r.text else f"status={r.status_code}"
+            return None, f"API {r.status_code}: {body}"
         fname = f"surf_{int(datetime.utcnow().timestamp())}.png"
         path = os.path.join(STATIC_DIR, fname)
         with open(path, "wb") as f:
             f.write(r.content)
-        return f"/static/{fname}"
+        return f"/static/{fname}", None
     except Exception as e:
-        print("[stability] Exception:", e)
-        return None
+        return None, f"Exception: {e}"
 
 # =========================
 # Tides (NOAA CO-OPS)
@@ -360,14 +363,14 @@ def forecast_image(
         if not force and cache_key in _ai_cache and now_ts - _ai_cache[cache_key]["ts"] < AI_CACHE_TTL_SECONDS:
             return _ai_cache[cache_key]["data"]
 
-    # buoy data
+    # Buoy
     if station_id:
         cond = fetch_noaa_conditions(station_id)
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
     else:
         station, cond = find_nearest_station_with_waves(lat, lon)
 
-    # weather
+    # Weather
     weather = fetch_current_weather(lat, lon)
     weather_desc = describe_weather(weather)
 
@@ -377,6 +380,7 @@ def forecast_image(
             "imageUrl": make_abs(request, "/static/forecast.jpg"),
             "station": station,
             "imageProvider": "placeholder",
+            "fallback_reason": "no_buoy_wave_data",
             "weather": weather,
             "weather_desc": weather_desc,
         }
@@ -384,13 +388,13 @@ def forecast_image(
             _ai_cache[cache_key] = {"data": data, "ts": now_ts}
         return data
 
-    # human summary
+    # Human summary
     parts = [f"{cond['wave_height_ft']} ft"]
     if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
     if cond.get("wind_speed_mph") is not None: parts.append(f"wind {cond['wind_speed_mph']} mph")
     base_summary = ", ".join(parts) + f" — {station['name']}"
 
-    # ---- Realistic (documentary) prompt ----
+    # Realistic (documentary) prompt
     prompt = (
         f"Ultra-realistic surf photograph taken with a DSLR camera near {station['name']}; "
         f"{weather_desc}; "
@@ -401,7 +405,7 @@ def forecast_image(
           "neutral color grade, true-to-life water color, sharp detail, 16:9 frame."
     )
 
-    image_rel = stability_ai_image(prompt)
+    image_rel, ai_error = stability_ai_image(prompt)
     provider = "stability" if image_rel else "placeholder"
     if not image_rel:
         image_rel = "/static/forecast.jpg"
@@ -411,6 +415,7 @@ def forecast_image(
         "imageUrl": make_abs(request, image_rel),
         "station": station,
         "imageProvider": provider,
+        "fallback_reason": ai_error,   # <-- NEW: tells you why we fell back
         "weather": weather,
         "weather_desc": weather_desc,
         "prompt_used": prompt
@@ -434,7 +439,7 @@ def wind(lat: float, lon: float):
 
 @app.get("/optimal-window")
 def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
-    # tide window (low → rising 2h)
+    # Fetch tide window (low → rising 2h)
     def _get(url: str):
         try:
             r = requests.get(url, timeout=12); r.raise_for_status(); return r.json()
@@ -494,7 +499,6 @@ def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
     wind_spd = cond.get("wind_speed_mph") if cond else None
     offshore = is_offshore_east_coast(wind_dir)
 
-    # note
     if window.get("start"):
         wave_height = cond.get("wave_height_ft") if cond else None
         if wave_height is not None and wave_height > 3:
