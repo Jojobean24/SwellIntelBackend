@@ -1,7 +1,6 @@
 import os
 import io
 import math
-import base64
 import requests
 from datetime import datetime, date, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
@@ -9,14 +8,14 @@ from typing import Dict, Tuple, Optional, List
 from fastapi import FastAPI, Query, Request, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from PIL import Image, ExifTags
 from dateutil import parser as dtparse
 
 # =========================
 # Config & env
 # =========================
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional for AI image
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
 STATIC_DIR = "static"
 AI_CACHE_TTL_SECONDS = 1800  # 30 min
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -64,10 +63,6 @@ def is_offshore_east_coast(wdir: Optional[float]) -> bool:
     if wdir is None: return False
     return 210 <= (wdir % 360) <= 330
 
-def is_onshore_east_coast(wdir: Optional[float]) -> bool:
-    if wdir is None: return False
-    return 30 <= (wdir % 360) <= 150
-
 def _float_or_none(x):
     try:
         if x is None: return None
@@ -77,7 +72,7 @@ def _float_or_none(x):
         return None
 
 # =========================
-# NOAA + Open-Meteo (existing surf logic)
+# NOAA + Open‑Meteo (surf logic)
 # =========================
 def get_noaa_stations():
     url = "https://www.ndbc.noaa.gov/activestations.xml"
@@ -169,7 +164,6 @@ def describe_weather(w: Optional[dict]) -> str:
     clouds = w.get("cloud_cover") or 0
     precip = (w.get("precip") or 0)
     is_day = w.get("is_day", 1) == 1
-
     if code in (45,48): base = "foggy"
     elif code in (51,53,55): base = "light drizzle"
     elif code in (61,63): base = "light rain"
@@ -245,7 +239,7 @@ def fetch_weekly(lat: float, lon: float, days: int = 5):
         return []
 
 # =========================
-# Stability AI image (kept, with messy bias)
+# Stability AI image (messy bias)
 # =========================
 def stability_ai_image(prompt: str):
     if not STABILITY_API_KEY:
@@ -291,11 +285,9 @@ def supabase_storage_upload(bucket: str, path: str, data: bytes, content_type: s
     r = requests.post(url, headers=headers, data=data, timeout=60)
     if r.status_code not in (200, 201):
         raise HTTPException(500, f"Supabase upload failed: {r.status_code} {r.text[:200]}")
-    # Public URL pattern for storage (previews should be in a public bucket)
     return f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{path}"
 
 def supabase_storage_upload_private(bucket: str, path: str, data: bytes, content_type: str) -> str:
-    # Upload to private bucket (no /public in URL)
     url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}"
     headers = {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -306,7 +298,6 @@ def supabase_storage_upload_private(bucket: str, path: str, data: bytes, content
     r = requests.post(url, headers=headers, data=data, timeout=60)
     if r.status_code not in (200, 201):
         raise HTTPException(500, f"Supabase upload failed: {r.status_code} {r.text[:200]}")
-    # Return a storage path (not public). You can sign URLs later.
     return f"{bucket}/{path}"
 
 def supabase_insert(table: str, payload: dict) -> dict:
@@ -320,7 +311,6 @@ def supabase_insert(table: str, payload: dict) -> dict:
 
 def supabase_select_photos_today(limit: int = 500) -> List[dict]:
     today = date.today().isoformat()
-    # photos created today (UTC)
     url = f"{SUPABASE_URL}/rest/v1/photos?select=*&created_at=gte.{today}T00:00:00Z&limit={limit}"
     r = requests.get(url, headers=sb_headers(json=False), timeout=30)
     if r.status_code != 200:
@@ -346,11 +336,10 @@ def exif_get_datetime(exif: dict) -> Optional[datetime]:
     for key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
         if key in exif:
             try:
-                # EXIF format 'YYYY:MM:DD HH:MM:SS'
                 s = exif[key]
                 s = s.replace("-", ":") if "-" in s and ":" not in s[:10] else s
                 dt = datetime.strptime(s, "%Y:%m:%d %H:%M:%S")
-                return dt.replace(tzinfo=timezone.utc)  # assume UTC if no tz
+                return dt.replace(tzinfo=timezone.utc)
             except Exception:
                 try:
                     return dtparse.parse(exif[key])
@@ -358,10 +347,9 @@ def exif_get_datetime(exif: dict) -> Optional[datetime]:
                     pass
     return None
 
-def exif_get_gps(exif: dict) -> Tuple[Optional[float], Optional[float]]:
+def exif_get_gps(exif: dict):
     gps = exif.get("GPSInfo")
     if not gps: return None, None
-
     def _conv(val):
         try:
             n, d = val
@@ -371,12 +359,10 @@ def exif_get_gps(exif: dict) -> Tuple[Optional[float], Optional[float]]:
                 return float(val)
             except Exception:
                 return None
-
     def _dms_to_deg(d, m, s, ref):
         deg = _conv(d) + _conv(m)/60.0 + _conv(s)/3600.0
         if ref in ["S", "W"]: deg = -deg
         return deg
-
     lat = lon = None
     try:
         lat = _dms_to_deg(gps[2][0], gps[2][1], gps[2][2], gps[1])
@@ -403,7 +389,7 @@ def make_preview(image_bytes: bytes, max_w: int = 800) -> bytes:
 def health(): return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
 # =========================
-# Routes — forecast & image (kept, messy bias)
+# Routes — forecast & image
 # =========================
 @app.get("/summary")
 def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
@@ -414,7 +400,6 @@ def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
     else:
         station, cond = find_nearest_station_with_waves(lat, lon)
         if not cond: return {"summary": "No live wave data available nearby.", "station": station}
-
     h_adj = max((cond.get("wave_height_ft") or 0) - 1.0, 0.0)
     parts = [f"{h_adj:.1f} ft (adj)"]
     if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
@@ -451,6 +436,7 @@ def forecast_image(request: Request, lat: float, lon: float, station_id: Optiona
         if cache_key: _ai_cache[cache_key] = {"data": data, "ts": now_ts}
         return data
 
+    # Messier, smaller bias
     h_adj = max((cond.get("wave_height_ft") or 0) - 1.5, 0.0)
     wdir = cond.get("wind_dir_deg"); wtxt = cond.get("wind_dir_txt") or ""
     ws = cond.get("wind_speed_mph") or 0
@@ -565,7 +551,8 @@ async def photos_upload(
     out = []
     for uf in files:
         content = await uf.read()
-        # Preview
+
+        # Build preview
         preview_jpg = make_preview(content, max_w=800)
 
         # EXIF
@@ -577,18 +564,15 @@ async def photos_upload(
         dt = exif_get_datetime(exif) or datetime.utcnow().replace(tzinfo=timezone.utc)
         lat, lon = exif_get_gps(exif)
 
-        # Camera model → rough FOV if provided (optional)
         cam_model = exif.get("Model") or exif.get("Make") or ""
-        fov = None
         try:
             fov = float(fov_deg) if fov_deg else None
         except:
             fov = None
 
-        if lat is None or lon is None:
+        if (lat is None or lon is None) and fallback_lat and fallback_lon:
             try:
-                if fallback_lat and fallback_lon:
-                    lat = float(fallback_lat); lon = float(fallback_lon)
+                lat = float(fallback_lat); lon = float(fallback_lon)
             except:
                 pass
 
@@ -598,13 +582,12 @@ async def photos_upload(
         photo_path = f"{photographer}/{ts}_{safe_name}"
         preview_path = f"{photographer}/{ts}_{os.path.splitext(safe_name)[0]}_preview.jpg"
 
-        # Upload to Supabase Storage
+        # Upload
         url_preview = supabase_storage_upload(BUCKET_PREVIEWS, preview_path, preview_jpg, "image/jpeg")
-        # Private full image (store path; you can sign URL later)
         _full_path = supabase_storage_upload_private(BUCKET_PHOTOS, photo_path, content, uf.content_type or "application/octet-stream")
-        url_full = _full_path  # stored as bucket/path
+        url_full = _full_path  # stored as bucket/path (private)
 
-        # Insert row
+        # Insert DB row
         row = supabase_insert("photos", {
             "photographer": photographer,
             "taken_at": dt.isoformat(),
@@ -667,9 +650,8 @@ def matches_today(lat: float, lon: float, radius_m: int = 400):
                 "url_preview": p.get("url_preview"),
                 "taken_at": t,
                 "distance_m": round(d, 1),
-                "confidence": 0.8 if d < radius_m/2 else 0.6,  # naive score
+                "confidence": 0.8 if d < radius_m/2 else 0.6,
                 "photographer": p.get("photographer"),
             })
-    # sort closest first
     hits.sort(key=lambda x: (x["distance_m"]))
     return {"count": len(hits), "items": hits}
