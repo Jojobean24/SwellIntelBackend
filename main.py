@@ -146,17 +146,17 @@ def stability_ai_image(prompt: str) -> Optional[str]:
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
     headers = {
         "Authorization": f"Bearer {STABILITY_API_KEY}",
-        "Accept": "image/*",  # IMPORTANT: their API expects this
+        "Accept": "image/*",  # Stability requires this
     }
-    # Send as form fields (Stability accepts form-data even without files)
-    data = {
-        "prompt": prompt,
-        "model": "sd3.5-large",
-        "output_format": "png",
-        "aspect_ratio": "16:9",
+    # IMPORTANT: use multipart/form-data
+    files = {
+        "prompt": (None, prompt),
+        "model": (None, "sd3.5-large"),
+        "output_format": (None, "png"),
+        "aspect_ratio": (None, "16:9"),
     }
     try:
-        r = requests.post(url, headers=headers, data=data, timeout=60)
+        r = requests.post(url, headers=headers, files=files, timeout=60)
         if r.status_code != 200:
             print("[stability] API error:", r.status_code, r.text[:400])
             return None
