@@ -2,7 +2,7 @@ import os
 import math
 import requests
 from datetime import datetime, date, timedelta
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,15 +11,12 @@ from fastapi.staticfiles import StaticFiles
 # =========================
 # Config / Environment
 # =========================
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # Set in Render → Environment
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")  # optional; if missing we use placeholder
 STATIC_DIR = "static"
 AI_CACHE_TTL_SECONDS = 1800  # 30 minutes
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-# =========================
-# FastAPI setup
-# =========================
-app = FastAPI(title="Swell Intel Backend", version="2.0.0")
+app = FastAPI(title="Swell Intel Backend", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -27,7 +24,6 @@ app.add_middleware(
 )
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# Simple in-memory cache for AI image responses
 _ai_cache: Dict[Tuple[float, float], Dict] = {}
 
 # =========================
@@ -48,6 +44,9 @@ def _float_or_none(x: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
 def deg_to_cardinal(deg: Optional[float]) -> Optional[str]:
     if deg is None: return None
     dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
@@ -55,16 +54,21 @@ def deg_to_cardinal(deg: Optional[float]) -> Optional[str]:
     return dirs[ix]
 
 def is_offshore_east_coast(wdir: Optional[float]) -> bool:
-    # Heuristic: W quadrant is offshore for most E-coast spots
     if wdir is None: return False
+    # W quadrant generally offshore for NE FL / East Coast
     return 210 <= (wdir % 360) <= 330
+
+def is_onshore_east_coast(wdir: Optional[float]) -> bool:
+    if wdir is None: return False
+    # E quadrant ~ onshore
+    return 30 <= (wdir % 360) <= 150
 
 def make_abs(request: Request, path: str) -> str:
     base = str(request.base_url).rstrip("/")
     return f"{base}{path if path.startswith('/') else '/' + path}"
 
 # =========================
-# NOAA Buoy data
+# NOAA Buoy (live)
 # =========================
 def get_noaa_stations():
     url = "https://www.ndbc.noaa.gov/activestations.xml"
@@ -93,7 +97,6 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     lines = r.text.splitlines()
     if len(lines) < 3:
         return None
-
     header = lines[0].split()
     latest = lines[2].split()
     idx = {h: i for i, h in enumerate(header)}
@@ -107,7 +110,7 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
     if wvht_m is None:
         return None
 
-    wind_mph = round(wspd_raw * 1.15078, 1) if wspd_raw is not None else None  # knots → mph
+    wind_mph = round(wspd_raw * 1.15078, 1) if wspd_raw is not None else None  # knots -> mph
     period_s = apd if apd is not None else dpd
 
     return {
@@ -115,7 +118,7 @@ def fetch_noaa_conditions(station_id: str) -> Optional[dict]:
         "wave_period_s": round(period_s, 1) if period_s is not None else None,
         "wind_speed_mph": wind_mph,
         "wind_dir_deg": wdir_deg,
-        "wind_dir_txt": deg_to_cardinal(wdir_deg),
+        "wind_dir_txt": deg_to_cardinal(wdir_deg) if wdir_deg is not None else None,
     }
 
 def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int = 300):
@@ -141,7 +144,7 @@ def find_nearest_station_with_waves(lat: float, lon: float, max_candidates: int 
     return stations[0], None
 
 # =========================
-# Open‑Meteo weather → words
+# Open‑Meteo (weather + marine)
 # =========================
 def fetch_current_weather(lat: float, lon: float) -> Optional[dict]:
     url = (
@@ -172,22 +175,14 @@ def describe_weather(w: Optional[dict]) -> str:
     precip = (w.get("precip") or 0)
     is_day = w.get("is_day", 1) == 1
 
-    if code in (45, 48):
-        base = "foggy"
-    elif code in (51, 53, 55):
-        base = "light drizzle"
-    elif code in (61, 63):
-        base = "light rain"
-    elif code in (65,):
-        base = "heavy rain"
-    elif code in (80, 81):
-        base = "showers"
-    elif code in (82,):
-        base = "heavy showers"
-    elif code in (71, 73, 75, 77, 85, 86):
-        base = "snow"
-    elif code in (95, 96, 99):
-        base = "thunderstorm"
+    if code in (45, 48): base = "foggy"
+    elif code in (51, 53, 55): base = "light drizzle"
+    elif code in (61, 63): base = "light rain"
+    elif code in (65,): base = "heavy rain"
+    elif code in (80, 81): base = "showers"
+    elif code in (82,): base = "heavy showers"
+    elif code in (71, 73, 75, 77, 85, 86): base = "snow"
+    elif code in (95, 96, 99): base = "thunderstorm"
     else:
         if clouds >= 85: base = "overcast"
         elif clouds >= 50: base = "mostly cloudy"
@@ -198,38 +193,81 @@ def describe_weather(w: Optional[dict]) -> str:
         if precip and precip >= 5: base = base.replace("light", "moderate")
         if precip and precip >= 15: base = base.replace("moderate", "heavy")
 
-    time_desc = "daylight" if is_day else "night"
-    return f"{base}, {time_desc}"
+    return f"{base}, {'daylight' if is_day else 'night'}"
+
+def fetch_weekly(lat: float, lon: float, days: int = 5):
+    # Marine waves
+    murl = (
+        "https://marine-api.open-meteo.com/v1/marine?"
+        f"latitude={lat}&longitude={lon}"
+        "&daily=wave_height_max,wave_height_mean,wave_period_max"
+        "&timezone=auto"
+    )
+    # Weather wind (daily + dominant dir)
+    wurl = (
+        "https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat}&longitude={lon}"
+        "&daily=wind_speed_10m_max,wind_direction_10m_dominant"
+        "&timezone=auto"
+    )
+    m = requests.get(murl, timeout=15).json()
+    w = requests.get(wurl, timeout=15).json()
+    out = []
+    dates = m.get("daily", {}).get("time", [])[:days]
+    hmax = m.get("daily", {}).get("wave_height_max", [])[:days]
+    hmean = m.get("daily", {}).get("wave_height_mean", [])[:days]
+    pmax = m.get("daily", {}).get("wave_period_max", [])[:days]
+    wspd = w.get("daily", {}).get("wind_speed_10m_max", [])[:days]
+    wdir = w.get("daily", {}).get("wind_direction_10m_dominant", [])[:days]
+
+    for i, d in enumerate(dates):
+        h_m = hmean[i] if i < len(hmean) else None
+        if h_m is None:
+            h_m = hmax[i] if i < len(hmax) else None
+        h_ft = round((h_m or 0) * 3.281, 1)
+        h_ft_adj = max(h_ft - 1.0, 0.0)  # subtract 1 ft per your note
+
+        ws = wspd[i] if i < len(wspd) else None
+        wd = wdir[i] if i < len(wdir) else None
+        offshore = is_offshore_east_coast(wd)
+        stars = 1
+        if h_ft_adj > 1: stars = 2
+        if h_ft_adj >= 3: stars = 3
+        if offshore: stars += 1
+        if h_ft_adj > 3 and offshore: stars = 5
+        stars = clamp(stars, 1, 5)
+
+        out.append({
+            "date": d,
+            "wave_height_ft_adj": round(h_ft_adj, 1),
+            "wave_period_s_max": pmax[i] if i < len(pmax) else None,
+            "wind_speed_mph_max": round((ws or 0) * 0.621371, 1) if ws is not None else None,  # km/h→mph
+            "wind_dir_deg_dom": wd,
+            "wind_dir_txt_dom": deg_to_cardinal(wd) if wd is not None else None,
+            "offshore": offshore,
+            "stars": stars,
+            "summary": f"{round(h_ft_adj,1)} ft, wind {round((ws or 0)*0.621371,1) if ws is not None else '--'} mph {deg_to_cardinal(wd) or '--'}",
+        })
+    return out
 
 # =========================
-# Stability (AI image) with debug
+# Image generation (Stability fallback to placeholder)
 # =========================
 def stability_ai_image(prompt: str):
-    """
-    Return (relative_path, error_message).
-    If generation succeeds: ("/static/..png", None)
-    If it fails: (None, "why it failed")
-    """
     if not STABILITY_API_KEY:
         return None, "STABILITY_API_KEY not set"
-
     url = "https://api.stability.ai/v2beta/stable-image/generate/core"
-    headers = {
-        "Authorization": f"Bearer {STABILITY_API_KEY}",
-        "Accept": "image/*",
-    }
-    # Try an accessible model first; adjust if your key isn't entitled
+    headers = { "Authorization": f"Bearer {STABILITY_API_KEY}", "Accept": "image/*" }
     files = {
         "prompt": (None, prompt),
-        "model": (None, "sd3.5-large"),   # alternatives: "sd3.5", "sd3.5-large-turbo", "sdxl-1.0"
+        "model": (None, "sd3.5"),  # lighter default; change to sd3.5-large(-turbo) if you have access
         "output_format": (None, "png"),
         "aspect_ratio": (None, "16:9"),
     }
     try:
         r = requests.post(url, headers=headers, files=files, timeout=60)
         if r.status_code != 200:
-            body = r.text[:300] if r.text else f"status={r.status_code}"
-            return None, f"API {r.status_code}: {body}"
+            return None, f"API {r.status_code}: {r.text[:300]}"
         fname = f"surf_{int(datetime.utcnow().timestamp())}.png"
         path = os.path.join(STATIC_DIR, fname)
         with open(path, "wb") as f:
@@ -239,83 +277,58 @@ def stability_ai_image(prompt: str):
         return None, f"Exception: {e}"
 
 # =========================
-# Tides (NOAA CO-OPS)
+# Tides (NOAA CO-OPS) for strike window
 # =========================
 def _noaa_get(url: str):
     try:
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        return r.json()
+        r = requests.get(url, timeout=12); r.raise_for_status(); return r.json()
     except Exception as e:
-        print("[tides] fetch error:", e)
-        return None
+        print("[tides] fetch error:", e); return None
 
 def fetch_todays_hilo(tide_station: str):
     today = date.today().strftime("%Y%m%d")
-    url = (
-        "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
-        f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
-        f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=hilo&format=json"
-    )
-    j = _noaa_get(url)
-    return j.get("predictions") if j else None
+    url = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
+           f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
+           f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=hilo&format=json")
+    j = _noaa_get(url); return j.get("predictions") if j else None
 
 def fetch_todays_hourly(tide_station: str):
     today = date.today().strftime("%Y%m%d")
-    url = (
-        "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
-        f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
-        f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=h&format=json"
-    )
-    j = _noaa_get(url)
-    return j.get("predictions") if j else None
+    url = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
+           f"product=predictions&application=swellintel&begin_date={today}&end_date={today}"
+           f"&datum=MLLW&station={tide_station}&time_zone=lst_ldt&units=english&interval=h&format=json")
+    j = _noaa_get(url); return j.get("predictions") if j else None
 
 def parse_low_to_rising_window_from_hilo(preds):
     if not preds: return None
-    fmt = "%Y-%m-%d %H:%M"
-    now = datetime.now()
+    fmt = "%Y-%m-%d %H:%M"; now = datetime.now()
     lows = [p for p in preds if p.get("type") == "L"]
     if not lows: return None
     next_low = None
     for p in lows:
         t = datetime.strptime(p["t"], fmt)
-        if t >= now:
-            next_low = t
-            break
-    if not next_low:
-        next_low = datetime.strptime(lows[-1]["t"], fmt)
+        if t >= now: next_low = t; break
+    if not next_low: next_low = datetime.strptime(lows[-1]["t"], fmt)
     return {"start": next_low.isoformat(), "end": (next_low + timedelta(hours=2)).isoformat()}
 
 def parse_low_to_rising_window_from_hourly(preds):
     if not preds: return None
-    fmt = "%Y-%m-%d %H:%M"
-    now = datetime.now()
+    fmt = "%Y-%m-%d %H:%M"; now = datetime.now()
     series = []
     for p in preds:
         try:
-            t = datetime.strptime(p["t"], fmt)
-            v = float(p["v"])
+            t = datetime.strptime(p["t"], fmt); v = float(p["v"])
             series.append((t, v))
-        except:
-            continue
+        except: pass
     if len(series) < 3: return None
-
     mins = []
-    for i in range(1, len(series) - 1):
-        t0, v0 = series[i-1]
-        t1, v1 = series[i]
-        t2, v2 = series[i+1]
-        if v1 <= v0 and v1 <= v2:
-            mins.append(series[i][0])
-
+    for i in range(1, len(series)-1):
+        _, v0 = series[i-1]; t1, v1 = series[i]; _, v2 = series[i+1]
+        if v1 <= v0 and v1 <= v2: mins.append(t1)
     next_low = None
     for t in mins:
-        if t >= now:
-            next_low = t
-            break
-    if not next_low:
-        next_low = mins[-1]
-
+        if t >= now: next_low = t; break
+    if not next_low: next_low = mins[-1]
     return {"start": next_low.isoformat(), "end": (next_low + timedelta(hours=2)).isoformat()}
 
 # =========================
@@ -332,19 +345,16 @@ def summary(lat: float, lon: float, station_id: Optional[str] = Query(None)):
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
         if not cond:
             return {"summary": f"No live wave data on station {station_id}.", "station": station}
-        parts = [f"{cond['wave_height_ft']} ft"]
-        if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
-        if cond.get("wind_speed_mph") is not None: parts.append(f"wind {cond['wind_speed_mph']} mph")
-        text = ", ".join(parts) + f" — {station['name']} ({station['id']})"
-        return {"summary": text, "station": station}
+    else:
+        station, cond = find_nearest_station_with_waves(lat, lon)
+        if not cond:
+            return {"summary": "No live wave data available nearby.", "station": station}
 
-    station, cond = find_nearest_station_with_waves(lat, lon)
-    if not cond:
-        return {"summary": "No live wave data available nearby.", "station": station}
-
-    parts = [f"{cond['wave_height_ft']} ft"]
+    # realism: subtract 1 ft
+    h_adj = max((cond.get("wave_height_ft") or 0) - 1.0, 0.0)
+    parts = [f"{h_adj:.1f} ft (adj)"]
     if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
-    if cond.get("wind_speed_mph") is not None: parts.append(f"wind {cond['wind_speed_mph']} mph")
+    if cond.get("wind_speed_mph") is not None: parts.append(f"wind {cond['wind_speed_mph']} mph {cond.get('wind_dir_txt') or ''}")
     text = ", ".join(parts) + f" — {station['name']} ({station['id']})"
     return {"summary": text, "station": station}
 
@@ -363,14 +373,12 @@ def forecast_image(
         if not force and cache_key in _ai_cache and now_ts - _ai_cache[cache_key]["ts"] < AI_CACHE_TTL_SECONDS:
             return _ai_cache[cache_key]["data"]
 
-    # Buoy
+    # Buoy & weather
     if station_id:
         cond = fetch_noaa_conditions(station_id)
         station = {"id": station_id, "name": f"NOAA {station_id}", "lat": lat, "lon": lon}
     else:
         station, cond = find_nearest_station_with_waves(lat, lon)
-
-    # Weather
     weather = fetch_current_weather(lat, lon)
     weather_desc = describe_weather(weather)
 
@@ -388,20 +396,29 @@ def forecast_image(
             _ai_cache[cache_key] = {"data": data, "ts": now_ts}
         return data
 
-    # Human summary
-    parts = [f"{cond['wave_height_ft']} ft"]
+    # Adjusted height & wind state
+    h_adj = max((cond.get("wave_height_ft") or 0) - 1.0, 0.0)
+    wdir = cond.get("wind_dir_deg")
+    onshore = is_onshore_east_coast(wdir)
+    offshore = is_offshore_east_coast(wdir)
+
+    # Summary text
+    parts = [f"{h_adj:.1f} ft (adj)"]
     if cond.get("wave_period_s") is not None: parts.append(f"@ {cond['wave_period_s']} s")
-    if cond.get("wind_speed_mph") is not None: parts.append(f"wind {cond['wind_speed_mph']} mph")
+    if cond.get("wind_speed_mph") is not None:
+        parts.append(f"wind {cond['wind_speed_mph']} mph {cond.get('wind_dir_txt') or ''}")
     base_summary = ", ".join(parts) + f" — {station['name']}"
 
-    # Realistic (documentary) prompt
+    # Prompt: realistic + surface condition based on wind
+    surface = "glassy, clean lines" if offshore else ("wind-blown chop, whitecaps, messy peaks" if onshore else "light texture")
     prompt = (
         f"Ultra-realistic surf photograph taken with a DSLR camera near {station['name']}; "
         f"{weather_desc}; "
-        f"waves approximately {cond['wave_height_ft']} feet"
+        f"waves approximately {h_adj:.1f} feet"
         + (f" at {cond['wave_period_s']} seconds" if cond.get('wave_period_s') is not None else "")
-        + (f", surface wind about {cond['wind_speed_mph']} mph" if cond.get('wind_speed_mph') is not None else "")
-        + ". Style: documentary surf report photo, unedited, no filters, no cinematic lighting, "
+        + (f", onshore wind about {cond['wind_speed_mph']} mph" if onshore and cond.get('wind_speed_mph') else "")
+        + (f", offshore wind about {cond['wind_speed_mph']} mph" if offshore and cond.get('wind_speed_mph') else "")
+        + f". Surface: {surface}. Style: documentary surf report photo, unedited, no filters, "
           "neutral color grade, true-to-life water color, sharp detail, 16:9 frame."
     )
 
@@ -415,7 +432,7 @@ def forecast_image(
         "imageUrl": make_abs(request, image_rel),
         "station": station,
         "imageProvider": provider,
-        "fallback_reason": ai_error,   # <-- NEW: tells you why we fell back
+        "fallback_reason": ai_error,
         "weather": weather,
         "weather_desc": weather_desc,
         "prompt_used": prompt
@@ -435,11 +452,12 @@ def wind(lat: float, lon: float):
         "wind_dir_deg": cond.get("wind_dir_deg"),
         "wind_dir_txt": cond.get("wind_dir_txt"),
         "offshore": is_offshore_east_coast(cond.get("wind_dir_deg")),
+        "onshore": is_onshore_east_coast(cond.get("wind_dir_deg")),
     }
 
 @app.get("/optimal-window")
 def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
-    # Fetch tide window (low → rising 2h)
+    # Tide window (low → rising 2h)
     def _get(url: str):
         try:
             r = requests.get(url, timeout=12); r.raise_for_status(); return r.json()
@@ -499,9 +517,12 @@ def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
     wind_spd = cond.get("wind_speed_mph") if cond else None
     offshore = is_offshore_east_coast(wind_dir)
 
+    # Note (kept your logic)
     if window.get("start"):
-        wave_height = cond.get("wave_height_ft") if cond else None
-        if wave_height is not None and wave_height > 3:
+        h_adj = None
+        if cond and cond.get("wave_height_ft") is not None:
+            h_adj = max(cond["wave_height_ft"] - 1.0, 0.0)
+        if h_adj is not None and h_adj > 3:
             note = "Go shred, it's good!" if offshore else "Go to work."
         else:
             note = "Surf's small, maybe work."
@@ -513,10 +534,15 @@ def optimal_window(lat: float, lon: float, tide_station: str = "8720291"):
         "window": window,
         "wind": {
             "dir_deg": wind_dir,
-            "dir_txt": deg_to_cardinal(wind_dir),
+            "dir_txt": deg_to_cardinal(wind_dir) if wind_dir is not None else None,
             "speed_mph": wind_spd,
             "offshore": offshore,
         },
         "buoy_station": station,
         "note": note,
     }
+
+@app.get("/weekly")
+def weekly(lat: float, lon: float, days: int = 5):
+    days = clamp(int(days), 1, 7)
+    return { "days": fetch_weekly(lat, lon, days) }
